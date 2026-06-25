@@ -51,12 +51,17 @@ def register(mcp) -> None:
         if err:
             return err
 
+        # 启动期被平台注入的 OMBRE_* 集合（在任何 dashboard 保存 mutate os.environ 之前快照）。
+        # from_boot=True ⇒ 该变量是平台级 env，重启后会覆盖 dashboard 存进 config.yaml 的值。
+        from utils import BOOT_ENV_OMBRE
+
         def _masked(name: str) -> dict:
-            return {"set": bool(os.environ.get(name, "").strip()), "value": None}
+            return {"set": bool(os.environ.get(name, "").strip()), "value": None,
+                    "from_boot": name in BOOT_ENV_OMBRE}
 
         def _plain(name: str) -> dict:
             v = os.environ.get(name, "").strip()
-            return {"set": bool(v), "value": v or None}
+            return {"set": bool(v), "value": v or None, "from_boot": name in BOOT_ENV_OMBRE}
 
         vars_data = [
             # LLM 压缩组

@@ -2550,9 +2550,14 @@
     <div class="config-section" id="sec-env">
       <h3>⑤ 环境变量</h3>
       <p style="font-size:12px;color:var(--text-light);margin:0 0 16px;line-height:1.6;">
-        这里改完保存会立即生效并写入 <code>.env</code>（重启后仍有效）。<br>
+        这里改完保存会立即生效并写入 <code>config.yaml</code>（重启后仍有效）。<br>
         API Key 字段显示脱敏值；输入新值才会覆盖，留空 = 不动。
       </p>
+      <!-- 平台环境变量冲突告警：当 OMBRE_* 由平台（如 Zeabur）env 注入时，
+           它优先级高于 config.yaml，重启会覆盖这里保存的值。由 refreshEnvConfig 填充。 -->
+      <div id="env-shadow-warning" style="display:none;background:rgba(200,80,60,0.10);
+        border:1px solid var(--negative);border-radius:8px;padding:10px 12px;margin:0 0 16px;
+        font-size:12px;line-height:1.7;color:var(--negative);"></div>
 
       <div style="margin-bottom:18px;">
         <div style="font-size:13px;font-weight:600;margin-bottom:8px;">压缩 LLM（脱水 / 打标 / 合并）</div>
@@ -5751,6 +5756,9 @@ async function refreshEnvConfig() {
     if (el) el.value = (f['OMBRE_HOOK_URL'] || {}).value || '';
     el = document.getElementById('env-hook-skip');
     if (el) { var skipVal = (f['OMBRE_HOOK_SKIP'] || {}).value || ''; el.value = (skipVal === 'true' || skipVal === '1' || skipVal === 'yes') ? 'true' : ''; }
+    // 平台 env 覆盖告警：检查哪些字段由启动期平台 env 注入（from_boot），
+    // 它们的优先级高于 config.yaml，重启会盖回——dashboard 在这里永远赢不了。
+    refreshEnvShadowWarning();
   } catch (e) {
     // 不再静默吞掉：把失败显示在状态行 + 用 placeholder 提示，避免 key 框卡在「加载中…」
     var st = document.getElementById('env-config-status');
@@ -5760,6 +5768,42 @@ async function refreshEnvConfig() {
       if (el2 && (!el2.placeholder || el2.placeholder.indexOf('加载') !== -1)) el2.placeholder = '（加载失败，请重试）';
     });
   }
+}
+
+// 检测「被平台环境变量接管」的字段并红字告警。
+// 数据源 /api/env-vars 的 from_boot=true ⇒ 该 OMBRE_* 在进程启动那一刻就由平台注入，
+// 优先级高于 config.yaml；dashboard 保存到 config.yaml 的同名值会在下次重启被它覆盖。
+// （注意：dashboard 保存当下也会写 os.environ，故必须用 from_boot 而非 set 来判定，
+//  否则保存后会误报。）
+async function refreshEnvShadowWarning() {
+  var box = document.getElementById('env-shadow-warning');
+  if (!box) return;
+  var LABELS = {
+    OMBRE_COMPRESS_BASE_URL: '压缩 Base URL',
+    OMBRE_COMPRESS_MODEL: '压缩 Model',
+    OMBRE_COMPRESS_API_KEY: '压缩 API Key',
+    OMBRE_EMBED_BASE_URL: '向量化 Base URL',
+    OMBRE_EMBED_MODEL: '向量化 Model',
+    OMBRE_EMBED_API_KEY: '向量化 API Key',
+  };
+  try {
+    var r = await authFetch('/api/env-vars');
+    if (!r) return;
+    var d = await readJsonSafe(r);
+    if (!d || !d.vars) return;
+    var shadowed = d.vars.filter(function (v) { return v.from_boot && LABELS[v.name]; });
+    if (!shadowed.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    var items = shadowed.map(function (v) {
+      return '<code>' + v.name + '</code>（' + LABELS[v.name] + '）';
+    }).join('、');
+    box.innerHTML =
+      '<strong>⚠ 这些字段由平台环境变量提供，重启后会覆盖你在此保存的值：</strong><br>' +
+      items + '<br>' +
+      '它们的优先级高于 <code>config.yaml</code>，所以即便这里改成别的服务商、保存生效了，' +
+      '下次重启/重新部署仍会被平台 env 打回。<br>' +
+      '彻底解决：到平台（如 Zeabur）的环境变量里<strong>删除上述变量</strong>，让 config.yaml/此面板成为唯一来源。';
+    box.style.display = 'block';
+  } catch (e) { /* 告警是增益信息，失败就静默不挡主流程 */ }
 }
 
 async function saveEnvConfig() {
