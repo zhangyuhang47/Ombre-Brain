@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -479,9 +480,18 @@ class EmbeddingEngine:
                 CREATE TABLE IF NOT EXISTS embeddings (
                     bucket_id TEXT PRIMARY KEY,
                     embedding TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT ''
                 )
             """)
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
+            }
+            if "content_hash" not in columns:
+                conn.execute(
+                    "ALTER TABLE embeddings ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS embeddings_meta (
                     key TEXT PRIMARY KEY,
@@ -609,13 +619,16 @@ class EmbeddingEngine:
             embedding = await self._generate_async(content)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            self._store_embedding(bucket_id, embedding, digest)
             return True
         except Exception as e:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
-    def _store_embedding(self, bucket_id: str, embedding: list[float]) -> None:
+    def _store_embedding(
+        self, bucket_id: str, embedding: list[float], content_hash: str = ""
+    ) -> None:
         try:
             from utils import now_iso  # type: ignore
         except ImportError:
@@ -623,8 +636,10 @@ class EmbeddingEngine:
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-                (bucket_id, json.dumps(embedding), now_iso()),
+                """INSERT OR REPLACE INTO embeddings
+                   (bucket_id, embedding, updated_at, content_hash)
+                   VALUES (?, ?, ?, ?)""",
+                (bucket_id, json.dumps(embedding), now_iso(), content_hash),
             )
             conn.commit()
         finally:
@@ -647,6 +662,27 @@ class EmbeddingEngine:
         finally:
             conn.close()
 
+    def list_content_hashes(self) -> dict[str, str]:
+        """Return hashes recorded by new writes; legacy rows contain ``""``."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT bucket_id, content_hash FROM embeddings"
+            ).fetchall()
+            return {str(bucket_id): str(digest or "") for bucket_id, digest in rows}
+        finally:
+            conn.close()
+
+    def get_content_hash(self, bucket_id: str) -> str:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT content_hash FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            ).fetchone()
+            return str(row[0] or "") if row else ""
+        finally:
+            conn.close()
+
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         conn = sqlite3.connect(self.db_path)
         try:
@@ -664,18 +700,12 @@ class EmbeddingEngine:
 
     # -------------------- 搜索 --------------------
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        """返回 [(bucket_id, similarity)] 按相似度倒序。"""
+    async def search_similar_strict(
+        self, query: str, top_k: int = 10
+    ) -> list[tuple[str, float]]:
+        """Return ranked neighbors, surfacing provider failures to the caller."""
         if not self.enabled:
-            return []
-        try:
-            query_embedding = await self._generate_async(query)
-            if not query_embedding:
-                return []
-        except Exception as e:
-            logger.warning(f"Query embedding failed: {e}")
-            return []
-
+            raise RuntimeError("embedding is disabled")
         conn = sqlite3.connect(self.db_path)
         try:
             rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
@@ -683,6 +713,10 @@ class EmbeddingEngine:
             conn.close()
         if not rows:
             return []
+
+        query_embedding = await self._generate_async(query)
+        if not query_embedding:
+            raise RuntimeError("embedding provider returned an empty query vector")
 
         results: list[tuple[str, float]] = []
         for bucket_id, emb_json in rows:
@@ -698,6 +732,14 @@ class EmbeddingEngine:
                 continue
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
+
+    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+        """返回 [(bucket_id, similarity)]；失败时兼容旧调用方并返回空列表。"""
+        try:
+            return await self.search_similar_strict(query, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"Query embedding failed: {e}")
+            return []
 
     async def search(self, query: str, top_k: int = 10) -> list[str]:
         """规范新接口：只返回 bucket_id 列表。"""

@@ -86,7 +86,7 @@ async def plan_create(
         await rt.bucket_mgr.update(bucket_id, **update_kwargs)
     except Exception as e:
         rt.logger.warning(f"plan() failed to set status/related: {e}")
-    # 注意：bucket_mgr.create() 内部已调用 _sync_embedding 为 content 生成并存好
+    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
     # 向量，这里不需要也不应该重复调用 generate_and_store（见 hold/feel.py 同类注释）。
     return f"📋plan→{bucket_id} [{status}]"
 
@@ -145,7 +145,7 @@ async def letter_write(
         await rt.bucket_mgr.update(bucket_id, **extra_meta)
     except Exception as e:
         rt.logger.warning(f"letter_write update meta failed: {e}")
-    # 注意：bucket_mgr.create() 内部已调用 _sync_embedding 为 content 生成并存好
+    # 注意：bucket_mgr.create() 已在 content 落盘后投递 embedding outbox
     # 向量，这里不需要也不应该重复调用 generate_and_store。
     return f"💌letter→{bucket_id} [{a}]"
 

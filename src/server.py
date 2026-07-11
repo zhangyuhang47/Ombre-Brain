@@ -50,6 +50,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
+from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, get_version, extract_wikilinks, parse_bool
@@ -221,6 +222,8 @@ except RuntimeError as _emb_err:
     logger.error(f"[STARTUP FAILED] {_emb_err}")
     raise SystemExit(f"Ombre Brain 启动中止：{_emb_err}") from _emb_err
 bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket manager / 记忆桶管理器
+embedding_outbox = EmbeddingOutbox(config, bucket_mgr, embedding_engine)
+bucket_mgr.attach_embedding_outbox(embedding_outbox)
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
@@ -360,6 +363,7 @@ _wsh.init_runtime(
     dehydrator=dehydrator,
     decay_engine=decay_engine,
     embedding_engine=embedding_engine,
+    embedding_outbox=embedding_outbox,
     import_engine=import_engine,
     migrate_engine=migrate_engine,
     github_sync_instance=github_sync_instance,
@@ -546,7 +550,7 @@ async def breath(
     tags: Optional[str] = "",
     catalog: Optional[bool] = False,
 ) -> str:
-    """检索并返回记忆桶。不传 query=返回权重最高的未解决记忆;传 query=按关键词+语义检索相关记忆。catalog=True=目录模式:只返回每桶一行元数据(名称|域|重要度,0 LLM 调用,最省 token),适合开新对话先看目录再 breath(query=...) 精准拉取,可配 domain 过滤。max_tokens=单次返回总 token 上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain 逗号分隔,valence/arousal 0~1(-1 忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大 50)。importance_min>=1=跳过语义检索,按重要度降序返回最多 20 条高重要度记忆。tags 逗号分隔,AND 过滤;tags=\"feel\" 或 \"__feel__\" 等价于 domain=\"feel\",返回所有 feel 类记忆。"""
+    """检索并返回记忆桶。不传 query=返回权重最高的未解决记忆;传 query=融合关键词/BM25+语义检索，向量或摘要服务不可用时明确提示并退回关键词+原文片段。catalog=True=目录模式:只返回每桶一行元数据(名称|域|重要度,0 LLM 调用,最省 token),适合开新对话先看目录再 breath(query=...) 精准拉取,可配 domain 过滤。max_tokens=单次返回总 token 上限(默认 config.surfacing.breath_max_tokens,fallback 10000)。domain 逗号分隔,valence/arousal 0~1(-1 忽略)。max_results=返回条数上限(默认 config.surfacing.breath_max_results,fallback 20,最大 50)。importance_min>=1=跳过语义检索,按重要度降序返回最多 20 条高重要度记忆。tags 逗号分隔,AND 过滤;tags=\"feel\" 或 \"__feel__\" 等价于 domain=\"feel\",返回所有 feel 类记忆。"""
     return await _with_notice(
         _t_breath.dispatch(
             query=query, max_tokens=max_tokens, domain=domain,
@@ -622,7 +626,7 @@ async def trace(
     dont_surface: Optional[int] = -1,
     why_remembered: Optional[str] = "",
 ) -> str:
-    """仅在明确需要修改某条已存在记忆时调用，不要猜测 bucket_id 或自行改写记忆。resolved=1=标记已放下,沉底仅在关键词触发时返回;resolved=0=重新激活;pinned=1=标记永久核心(锁 importance=10),0=取消;digested=1=标记已消化,加速淡化;content=替换桶正文并重建 embedding;delete=True=移入 archive 并标记 deleted_at（只是归档，Markdown 文件不会被物理删除）;status=plan 桶状态(active/resolved/abandoned);weight=plan 承诺重量 0.0-1.0;dont_surface=1=不再出现在 breath,0=恢复;why_remembered=更新记录原因。只传需要修改的字段,-1 或空串表示不改。"""
+    """仅在明确需要修改某条已存在记忆时调用，不要猜测 bucket_id 或自行改写记忆。resolved=1=标记已放下,沉底仅在关键词触发时返回;resolved=0=重新激活;pinned=1=标记永久核心(锁 importance=10),0=取消;digested=1=标记已消化,加速淡化;content=替换桶正文并在落盘后排队重建 embedding;delete=True=移入 archive 并标记 deleted_at（只是归档，Markdown 文件不会被物理删除）;status=plan 桶状态(active/resolved/abandoned);weight=plan 承诺重量 0.0-1.0;dont_surface=1=不再出现在 breath,0=恢复;why_remembered=更新记录原因。只传需要修改的字段,-1 或空串表示不改。"""
     return await _with_notice(
         _t_trace.dispatch(
             bucket_id=bucket_id, name=name, domain=domain,
@@ -901,6 +905,10 @@ if __name__ == "__main__":
                         await _ollama_local.ensure_child_on_boot()
                     except Exception as _ol_exc:
                         logger.warning(f"ollama child boot failed: {_ol_exc}")
+                    try:
+                        await embedding_outbox.start()
+                    except Exception as _outbox_exc:
+                        logger.warning(f"embedding outbox start failed: {_outbox_exc}")
                     # #4a ②：启动成功（app 已初始化、引擎已起、即将开始服务）→ 清零 entrypoint
                     # 的崩溃计数 .boot_fails。崩在这之前（import/init）= 启动失败，计数保留，
                     # 连续失败由 entrypoint 回滚到 _prev。只在「从持久卷 CODE_DIR 跑」时存在该文件。
@@ -915,6 +923,10 @@ if __name__ == "__main__":
                     except Exception as _bf_exc:
                         logger.warning(f"reset .boot_fails failed: {_bf_exc}")
                     yield
+                    try:
+                        await embedding_outbox.stop()
+                    except Exception:
+                        pass
                     try:
                         await decay_engine.stop()
                     except Exception:

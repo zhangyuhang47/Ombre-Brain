@@ -59,12 +59,12 @@ _ollama_pull_state: dict = {"running": False, "model": "", "percent": 0, "status
 _ollama_pull_task: "asyncio.Task | None" = None  # 持有引用防止被 GC
 
 # --- backfill（只补缺失向量，区别于 migrate 全库重算）---
-# 用途：v2.2 前建的桶（尤其 permanent）落盘时没走 create() 内置 _sync_embedding，
+# 用途：v2.2 前建的桶（尤其 permanent）可能没有向量，
 # embeddings.db 里没有它们的行 → breath 语义检索查不到。migrate 能修但会重算全库、
 # 浪费 API 额度；backfill 只给「文件在、向量缺」的桶补一发，幂等、便宜。
 _backfill_state: dict = {
     "running": False, "scanned": 0, "missing": 0, "done": 0,
-    "failed": 0, "status": "idle", "error": "",
+    "failed": 0, "queued": 0, "status": "idle", "error": "",
 }
 _backfill_task: "asyncio.Task | None" = None  # 持有引用防止被 GC
 
@@ -133,6 +133,25 @@ async def _backfill_run() -> None:
         all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
         _backfill_state["scanned"] = len(all_buckets)
 
+        # Managed server runtimes have one durable writer for the derived
+        # index. Reuse it so manual backfill, startup reconciliation, and
+        # decay self-healing cannot race each other or bypass retry state.
+        outbox = sh.embedding_outbox
+        if outbox is not None and getattr(outbox, "running", False):
+            queued = await outbox.reconcile(
+                buckets=all_buckets,
+                include_archive=True,
+            )
+            outbox.retry_now()
+            queue_state = outbox.status()
+            _backfill_state.update(
+                missing=queue_state["pending"],
+                failed=queue_state["retrying"],
+                queued=queued,
+                status="queued",
+            )
+            return
+
         # 先扫出缺向量的桶（空内容的跳过——没法向量化）
         missing: list[tuple[str, str]] = []
         for b in all_buckets:
@@ -189,6 +208,11 @@ def register(mcp) -> None:
             "db_path": getattr(sh.embedding_engine, "db_path", ""),
             "db_count": 0,
             "db_meta": {},
+            "outbox": (
+                sh.embedding_outbox.status()
+                if sh.embedding_outbox is not None
+                else None
+            ),
         }
         # 主表行数
         try:
@@ -341,12 +365,26 @@ def register(mcp) -> None:
             fetch_buckets=_fetch_buckets,
         )
 
-        def _on_complete(success: bool) -> None:
-            if not success:
-                logger.warning("[migration] task finished with failures; sh.embedding_engine NOT swapped")
+        outbox = sh.embedding_outbox
+        outbox_was_running = bool(
+            outbox is not None and getattr(outbox, "running", False)
+        )
+
+        def _restart_outbox() -> None:
+            if not outbox_was_running or outbox is None:
                 return
-            # 成功 → 把 global engine 切到目标
             try:
+                import asyncio as _aio
+                _aio.create_task(outbox.start(reconcile=True))
+            except Exception as e:
+                logger.error(f"[migration] embedding outbox restart failed: {e}")
+
+        def _on_complete(success: bool) -> None:
+            try:
+                if not success:
+                    logger.warning("[migration] task finished with failures; sh.embedding_engine NOT swapped")
+                    return
+                # 成功 → 把 global engine 切到目标
                 sh.replace_embedding_engine(target_engine)
                 # 持久化到 config（进程内 + config.yaml，重启/重建不丢）
                 cfg_emb = sh.config.setdefault("embedding", {})
@@ -378,9 +416,17 @@ def register(mcp) -> None:
                 logger.info(f"[migration] sh.embedding_engine swapped to backend={target_backend} format={req_api_format or '(unchanged)'}; persisted to config.yaml")
             except Exception as e:
                 logger.error(f"[migration] post-swap failed: {e}")
+            finally:
+                _restart_outbox()
+
+        # Migration rewrites the same SQLite index. Stop the normal queue
+        # worker for the migration window, then restart it in the callback.
+        if outbox_was_running:
+            await outbox.stop()
 
         task = start_migration(mig_cfg, on_complete=_on_complete)
         if task is None:
+            _restart_outbox()
             return JSONResponse({
                 "ok": False,
                 "error": "无法启动迁移任务（锁未获得）",
@@ -432,7 +478,11 @@ def register(mcp) -> None:
             return err
 
         engine = sh.embedding_engine
-        if not engine or not getattr(engine, "enabled", False):
+        managed_outbox = bool(
+            sh.embedding_outbox is not None
+            and getattr(sh.embedding_outbox, "running", False)
+        )
+        if (not engine or not getattr(engine, "enabled", False)) and not managed_outbox:
             return JSONResponse({
                 "ok": False,
                 "error": "向量化未启用（缺 key / 本地模型未就绪），无法补齐。",
@@ -459,7 +509,7 @@ def register(mcp) -> None:
         import asyncio as _aio
         _backfill_state = {
             "running": True, "scanned": 0, "missing": 0, "done": 0,
-            "failed": 0, "status": "scanning", "error": "",
+            "failed": 0, "queued": 0, "status": "scanning", "error": "",
         }
         _backfill_task = _aio.create_task(_backfill_run())
         return JSONResponse({
@@ -474,7 +524,16 @@ def register(mcp) -> None:
         err = sh._require_auth(request)
         if err:
             return err
-        return JSONResponse({"ok": True, "backfill": _backfill_state})
+        outbox_state = (
+            sh.embedding_outbox.status()
+            if sh.embedding_outbox is not None
+            else None
+        )
+        return JSONResponse({
+            "ok": True,
+            "backfill": _backfill_state,
+            "outbox": outbox_state,
+        })
 
     @mcp.custom_route("/api/embedding/local/status", methods=["GET"])
     async def api_embedding_local_status(request: Request) -> Response:

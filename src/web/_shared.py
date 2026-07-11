@@ -115,6 +115,7 @@ bucket_mgr = None
 dehydrator = None
 decay_engine = None
 embedding_engine = None
+embedding_outbox = None
 import_engine = None
 migrate_engine = None
 github_sync_instance = None
@@ -167,6 +168,12 @@ def replace_embedding_engine(engine) -> None:
             tools_runtime = None
     if tools_runtime is not None:
         tools_runtime.embedding_engine = engine
+    outbox = globals().get("embedding_outbox")
+    if outbox is not None:
+        try:
+            outbox.set_embedding_engine(engine)
+        except Exception:
+            logger.warning("Failed to refresh embedding outbox engine", exc_info=True)
 
 
 def evaluate_v3_update_manifest(manifest, content_by_path):

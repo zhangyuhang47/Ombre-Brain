@@ -10,7 +10,7 @@ tools/_common.py — 跨工具共享的辅助逻辑
 关键行为：
 - check_content_size / check_pinned_quota：读取 config.limits，超限返回中文提示串
 - merge_or_create：先用语义检索找近似桶；超过阈值则合并（hold 用原文拼接，
-  grow 用 LLM 压缩），否则新建；写完同步刷新 embedding 与脱水缓存
+  grow 用 LLM 压缩），否则新建；写完投递 embedding 队列并刷新脱水缓存
 - iter 2.0：merge_or_create 接受 ``source_tool`` / ``grow_batch_id``，
   新建时写入 frontmatter；合并时不动原桶 source_tool，只追加 ``last_merged_by``
 - check_duplicate_for：fire-and-forget 标记疑似重复对（不自动合并）
@@ -451,29 +451,37 @@ async def _merge_or_create_inner(
         # hold 的铁律：正文优先落盘。打标/embedding 可降级，但绝不压缩或撤销记忆。
         allow_embedding_fallback=(raw_merge and source_tool == "hold"),
     )
-    # iter 2.1+ 起 create() 内部已调用 _sync_embedding，此处无需重复生成。
-    # 只需从 embedding_engine 探测上次是否成功（检查 db 中是否有该 id）。
-    # 失败时返回警告（降级，不报错）——embedding 失败桶仍有效，仅丧失语义检索能力。
+    # create() 已在原文落盘后投递 embedding outbox，此处无需重复生成。
+    # Managed runtime 下 queued 是正常成功态，不应在网络请求真正完成前误报
+    # “向量失败”；没有 outbox 的兼容运行时才检查同步尝试的结果。
     embed_warn = ""
-    try:
-        if rt.embedding_engine and getattr(rt.embedding_engine, "enabled", False):
+    embedding_state = "disabled"
+    outbox = getattr(rt.bucket_mgr, "embedding_outbox", None)
+    if outbox is not None and outbox.is_pending(bucket_id):
+        embedding_state = "queued"
+    elif rt.embedding_engine and getattr(rt.embedding_engine, "enabled", False):
+        try:
             existing = await rt.embedding_engine.get_embedding(bucket_id)
             if existing is None:
+                embedding_state = "missing"
                 embed_warn = _EMBED_WARN
                 rt.logger.info(
                     f"op=merge_or_create phase=branch branch=embed_degrade bucket_id={bucket_id} "
                     f"reason=no_embedding_after_create"
                 )
-    except Exception as _embed_exc:
-        embed_warn = _EMBED_WARN
-        rt.logger.info(
-            f"op=merge_or_create phase=branch branch=embed_degrade bucket_id={bucket_id} "
-            f"reason={type(_embed_exc).__name__}"
-        )
+            else:
+                embedding_state = "indexed"
+        except Exception as _embed_exc:
+            embedding_state = "missing"
+            embed_warn = _EMBED_WARN
+            rt.logger.info(
+                f"op=merge_or_create phase=branch branch=embed_degrade bucket_id={bucket_id} "
+                f"reason={type(_embed_exc).__name__}"
+            )
     rt.logger.info(
         f"op=merge_or_create phase=branch branch=create bucket_id={bucket_id} "
         f"source_tool={source_tool or '_'} grow_batch_id={grow_batch_id or '_'} "
-        f"embed_ok={int(not embed_warn)}"
+        f"embedding_state={embedding_state}"
     )
     return bucket_id, False, embed_warn
 

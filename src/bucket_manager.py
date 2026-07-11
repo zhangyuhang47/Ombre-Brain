@@ -11,8 +11,8 @@ bucket_manager.py — 记忆桶的增删改查与多维索引
 - 创建/读取/更新/删除/搬家（move）都在这里
 - 检索 = 先按 domain 预筛，再按情感坐标 + 文本相似度加权排序
 - 情感坐标是 Russell 环形模型的连续值：valence 0~1（消极→积极），arousal 0~1（平静→激动）
-- create()/update(content=...)/delete() 自动同步 embedding 索引（iter 2.1+）；
-  一般写入仍严格要求向量化，`hold` 则允许索引失败后保留原文待后补
+- create()/update(content=...) 先落盘再投递 embedding outbox；delete() 清理派生索引
+- 所有记忆类型都以 Markdown 为真源；向量化失败不会回滚原文，由后台统一重试
 - iter 2.0：create() 接受 ``bucket_id_override``（feel 用分钟级可读 id），
   以及 ``source_tool`` / ``grow_batch_id`` 用于来源追踪
 
@@ -32,6 +32,7 @@ import math
 import asyncio
 import logging
 import shutil
+import time
 import uuid
 from datetime import date, datetime
 
@@ -155,6 +156,7 @@ _RIPPLE_BOOST = 0.3        # 唤醒时 activation_count 增量
 
 # --- search 评分 ---
 _VECTOR_TOPK = 50          # embedding 预取 top_k（仅作 semantic 分源，不窄化候选集）
+_VECTOR_RECALL_THRESHOLD = 0.65  # 纯语义候选进入结果池的最低余弦相似度
 _RESOLVED_RANK_PENALTY = 0.3   # resolved 桶仅在排序时降权
 _LITERAL_MATCH_BONUS = 25.0    # 查询串原样命中 name/tags/domain/正文时的召回加分（修短查询召回）
 
@@ -239,6 +241,7 @@ class BucketManager:
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
+        self.embedding_outbox = None
         ledger_path = config.get("ledger_path") or os.path.join(
             self.base_dir, "_ledger", "events.jsonl"
         )
@@ -247,13 +250,29 @@ class BucketManager:
         # BM25 稀疏索引（写操作后脏标记，search() 时懒重建）
         self._bm25: "_BM25Index | None" = _BM25Index() if _BM25Index is not None else None
         self._bm25_dirty: bool = True
-        self._bm25_rebuilding: bool = False
+        self._bm25_rebuilding: bool = False  # Avoid concurrent duplicate rebuilds.
 
-        # Active-bucket cache is invalidated together with BM25 after writes.
+        # Active-bucket cache and its on-disk fingerprint are invalidated after writes.
         self._active_cache: "list[dict] | None" = None
+        self._active_file_state: dict[str, tuple[int, int]] = {}
+        self._active_cache_lock = asyncio.Lock()
+        storage_cfg = config.get("storage", {}) or {}
+        try:
+            self.external_change_poll_seconds = max(
+                0.0, float(storage_cfg.get("external_change_poll_seconds", 1.0))
+            )
+        except (TypeError, ValueError):
+            self.external_change_poll_seconds = 1.0
+        self._last_file_state_check = 0.0
+        self._external_changes_detected = 0
+        self._last_external_change = ""
 
     def attach_v3_runtime(self, runtime) -> None:
         self.v3_runtime = runtime
+
+    def attach_embedding_outbox(self, outbox) -> None:
+        """Attach the durable derived-index queue after both objects exist."""
+        self.embedding_outbox = outbox
 
     def _record_v3_bucket_event(
         self,
@@ -398,30 +417,57 @@ class BucketManager:
     # Internal: keep embedding index in sync with markdown storage
     # 内部：保证向量索引与 markdown 存储层一致
     # ---------------------------------------------------------
-    def _require_embedding_available(self) -> None:
-        """create()/update(content=...) 落盘前的硬性前置校验。
-
-        默认写入严格要求 embedding；未配置 / 未启用时直接拒绝。
-        `hold` 会显式传入 allow_embedding_fallback=True，以“正文不丢”为更高优先级，
-        允许 Markdown 先落盘、向量稍后补齐。
-        """
+    async def _sync_embedding(self, bucket_id: str, content: str) -> bool:
+        """Best-effort inline indexing for runtimes without a queue worker."""
         if not self.embedding_engine or not getattr(self.embedding_engine, "enabled", False):
-            raise RuntimeError(
-                "embedding 未配置或未启用，拒绝写入：本系统要求向量化必须可用才能记录/修改记忆。"
-                "请在设置中配置 OMBRE_EMBED_API_KEY，或用「本地向量模型」面板装好 Ollama + bge-m3。"
-            )
-
-    async def _sync_embedding(self, bucket_id: str, content: str) -> None:
-        """create()/update(content=...) 调用，写入向量。
-
-        调用前必须已经过 _require_embedding_available() 校验。这里仍然
-        显式重复防御一次（未启用直接抛），失败时也不再降级吞掉——调用方
-        没有 embedding 就不该被允许把内容落盘。"""
-        if not self.embedding_engine or not getattr(self.embedding_engine, "enabled", False):
-            raise RuntimeError("embedding 未配置或未启用，拒绝写入。")
+            return False
         if not content or not content.strip():
-            return
-        await self.embedding_engine.generate_and_store(bucket_id, content)
+            return True
+        return bool(
+            await self.embedding_engine.generate_and_store(bucket_id, content)
+        )
+
+    async def _index_after_write(self, bucket_id: str, content: str) -> None:
+        """Queue derived indexing after Markdown is safely on disk.
+
+        The server runtime starts a durable outbox worker, so this returns
+        without waiting for network I/O.  Standalone/stdio users still get one
+        inline attempt; failures remain queued for a later managed startup.
+        """
+        outbox = self.embedding_outbox
+        queued = False
+        if outbox is not None:
+            try:
+                queued = bool(outbox.enqueue(bucket_id, content))
+            except Exception as exc:
+                logger.error(
+                    "Failed to persist embedding outbox item for %s: %s",
+                    bucket_id,
+                    exc,
+                )
+            if queued and getattr(outbox, "running", False):
+                return
+
+        try:
+            indexed = await self._sync_embedding(bucket_id, content)
+        except Exception as exc:
+            indexed = False
+            logger.warning(
+                "Inline embedding attempt failed; memory remains queued / "
+                "同步向量尝试失败，记忆已保留待后台重试: %s: %s",
+                bucket_id,
+                exc,
+            )
+        if indexed and outbox is not None:
+            try:
+                outbox.discard(bucket_id)
+            except Exception:
+                logger.warning("Failed to acknowledge embedding outbox item: %s", bucket_id)
+        elif not indexed:
+            logger.warning(
+                "Memory saved without vector; pending retry / 记忆已落盘，向量待重试: %s",
+                bucket_id,
+            )
 
     def _invalidate_bm25(self) -> None:
         """写操作后调用：标记 BM25 需重建 + 清活跃桶缓存（集合已变，缓存作废）。
@@ -430,8 +476,17 @@ class BucketManager:
         """
         self._bm25_dirty = True
         self._active_cache = None
+        self._active_file_state = {}
+        self._last_file_state_check = 0.0
 
-    def _cache_bump(self, bucket_id: str, *, last_active=None, activation_count=None) -> None:
+    def _cache_bump(
+        self,
+        bucket_id: str,
+        *,
+        last_active=None,
+        activation_count=None,
+        file_path: str = "",
+    ) -> None:
         """touch/ripple 只改了某桶的激活字段（集合没变）→ 就地更新缓存，不清整表。"""
         if self._active_cache is None:
             return
@@ -444,6 +499,141 @@ class BucketManager:
                     if activation_count is not None:
                         m["activation_count"] = activation_count
                 break
+        if file_path:
+            self._refresh_cached_file_state(file_path)
+
+    def _refresh_cached_file_state(self, file_path: str) -> None:
+        """Acknowledge an internal in-place write without invalidating the cache."""
+        if self._active_cache is None:
+            return
+        normalized = os.path.normcase(os.path.abspath(file_path))
+        try:
+            stat = os.stat(file_path)
+            self._active_file_state[normalized] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self._active_file_state.pop(normalized, None)
+        self._last_file_state_check = time.monotonic()
+
+    def _scan_active_file_state(self) -> dict[str, tuple[int, int]]:
+        """Return a cheap metadata fingerprint for every active Markdown file."""
+        state: dict[str, tuple[int, int]] = {}
+        for _root, _fname, file_path in self._iter_md_files(self._active_dirs):
+            try:
+                stat = os.stat(file_path)
+            except OSError:
+                continue
+            state[os.path.normcase(os.path.abspath(file_path))] = (
+                stat.st_mtime_ns,
+                stat.st_size,
+            )
+        return state
+
+    def external_change_status(self) -> dict[str, Any]:
+        return {
+            "poll_seconds": self.external_change_poll_seconds,
+            "detected": self._external_changes_detected,
+            "last_detected": self._last_external_change,
+            "cached_files": len(self._active_file_state),
+        }
+
+    def _reconcile_external_changes(
+        self,
+        previous: list[dict],
+        current: list[dict],
+    ) -> None:
+        """Propagate externally-created/edited/deleted Markdown to derived state."""
+        old_by_id = {str(bucket.get("id") or ""): bucket for bucket in previous}
+        new_by_id = {str(bucket.get("id") or ""): bucket for bucket in current}
+        old_by_id.pop("", None)
+        new_by_id.pop("", None)
+
+        added_ids = set(new_by_id) - set(old_by_id)
+        removed_ids = set(old_by_id) - set(new_by_id)
+        content_changed_ids = {
+            bucket_id
+            for bucket_id in set(old_by_id) & set(new_by_id)
+            if str(old_by_id[bucket_id].get("content") or "")
+            != str(new_by_id[bucket_id].get("content") or "")
+        }
+        updated_ids = {
+            bucket_id
+            for bucket_id in set(old_by_id) & set(new_by_id)
+            if bucket_id in content_changed_ids
+            or (old_by_id[bucket_id].get("metadata") or {})
+            != (new_by_id[bucket_id].get("metadata") or {})
+        }
+
+        outbox = self.embedding_outbox
+        if outbox is not None:
+            for bucket_id in sorted(added_ids | content_changed_ids):
+                try:
+                    outbox.enqueue(
+                        bucket_id,
+                        str(new_by_id[bucket_id].get("content") or ""),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "external edit embedding enqueue failed for %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+            for bucket_id in sorted(removed_ids):
+                try:
+                    outbox.discard(bucket_id)
+                except Exception:
+                    pass
+
+        for bucket_id in sorted(removed_ids):
+            # Moving a file to archive is not physical deletion; keep its
+            # derived vector. Only remove the index when the ID vanished from
+            # every managed directory.
+            if self._find_bucket_file(bucket_id) is not None:
+                continue
+            if self.embedding_engine is not None:
+                try:
+                    self.embedding_engine.delete_embedding(bucket_id)
+                except Exception as exc:
+                    logger.warning(
+                        "external delete embedding cleanup failed for %s: %s",
+                        bucket_id,
+                        exc,
+                    )
+
+        for bucket_id in sorted(added_ids):
+            bucket = new_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_create",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+        for bucket_id in sorted(updated_ids):
+            bucket = new_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_update",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+        for bucket_id in sorted(removed_ids):
+            bucket = old_by_id[bucket_id]
+            self._record_v3_bucket_event(
+                "external_delete",
+                bucket_id,
+                str((bucket.get("metadata") or {}).get("type") or "dynamic"),
+                str(bucket.get("content") or ""),
+                dict(bucket.get("metadata") or {}),
+            )
+
+        logger.info(
+            "External vault change reconciled / 外部记忆文件变更已对账: "
+            "added=%s changed=%s removed=%s",
+            len(added_ids),
+            len(updated_ids),
+            len(removed_ids),
+        )
 
     def _build_bm25_index(self, buckets: list):
         """在线程里构建一个**全新**的 BM25 索引并返回（性能 P4：jieba 全库分词很慢）。"""
@@ -505,10 +695,8 @@ class BucketManager:
           ``feel_202605011423_V085``）。如果与已有桶冲突，自动追加秒级后缀。
           为空 → 走默认 ``generate_bucket_id()``（12 位 hex）。
         """
-        # 默认写入仍要求 embedding 可用。hold 明确选择 fallback 时，正文优先落盘，
-        # 缺失向量由 backfill 后补；这条例外不扩散到 grow/trace。
-        if not allow_embedding_fallback:
-            self._require_embedding_available()
+        # ``allow_embedding_fallback`` is retained for API compatibility.
+        # All memory types now write first; embedding is a derived index.
 
         # F-04: 清洗 content / tags / name 中的危险控制字符和双向覆写符
         content = self._sanitize_text(content)
@@ -674,23 +862,9 @@ class BucketManager:
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
 
-        # --- iter 2.1+: 索引/存储一致性 —— 桶落盘后立刻同步生成 embedding ---
-        # _require_embedding_available() 已在函数开头校验过，这里走到的就该成功；
-        # 万一调用期间 embedding 真的失败（如网络抖动），不再静默 warning——
-        # 文件已经写盘，異常向上抛由调用方决定是否清理半成品文件。
-        try:
-            await self._sync_embedding(bucket_id, linked_content)
-        except Exception as exc:
-            if not allow_embedding_fallback:
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
-                raise
-            logger.warning(
-                f"hold embedding unavailable; kept raw bucket for later backfill / "
-                f"hold 向量化不可用，已保留原文待后补: {bucket_id}: {type(exc).__name__}: {exc}"
-            )
+        # Markdown is committed before any derived-index work. The managed
+        # server enqueues and returns immediately; standalone mode tries once.
+        await self._index_after_write(bucket_id, linked_content)
         self._invalidate_bm25()
         self._record_v3_bucket_event(
             "create",
@@ -769,11 +943,6 @@ class BucketManager:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
-
-        # content 改动会触发 embedding 重新生成（见下方 _sync_embedding 调用），
-        # 同样要求 fail-fast：embedding 不可用就拒绝，不碰文件（不写入半新半旧状态）。
-        if "content" in kwargs and not allow_embedding_fallback:
-            self._require_embedding_available()
 
         # Normalize public/migration inputs at the storage boundary.  A quoted
         # YAML value such as "false" must never be persisted as true merely
@@ -925,21 +1094,10 @@ class BucketManager:
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
 
-        # --- iter 2.1+: content 改动 → 同步刷新 embedding ---
-        # 函数开头已校验过 embedding 可用；这里仍可能因调用瞬间网络/限流失败，
-        # 失败不再静默吞掉——异常向上抛，调用方（trace 等）据此向用户报错。
-        # 注意：文件内容此时已落盘，调用方需要知道这是「半失败」状态。
+        # Content is already committed. Queue the derived vector without
+        # turning provider failure into a false "memory write failed" result.
         if "content" in kwargs:
-            try:
-                await self._sync_embedding(bucket_id, post.content or "")
-            except Exception as exc:
-                if not allow_embedding_fallback:
-                    raise
-                logger.warning(
-                    f"hold merge embedding unavailable; kept appended raw content / "
-                    f"hold 合并后向量化不可用，已保留追加原文待后补: "
-                    f"{bucket_id}: {type(exc).__name__}: {exc}"
-                )
+            await self._index_after_write(bucket_id, post.content or "")
         self._invalidate_bm25()
         self._record_v3_bucket_event(
             "update",
@@ -1008,6 +1166,11 @@ class BucketManager:
             return False
 
         # iter 1.6 §4：仍清理 embedding，避免孤儿向量占用空间
+        if self.embedding_outbox is not None:
+            try:
+                self.embedding_outbox.discard(bucket_id)
+            except Exception as e:
+                logger.warning(f"discard embedding outbox failed for {bucket_id}: {e}")
         if self.embedding_engine is not None:
             try:
                 self.embedding_engine.delete_embedding(bucket_id)
@@ -1057,7 +1220,12 @@ class BucketManager:
             post["activation_count"] = int(post.get("activation_count") or 0) + 1  # type: ignore[call-overload]
 
             _atomic_write_text(file_path, frontmatter.dumps(post))
-            self._cache_bump(bucket_id, last_active=post["last_active"], activation_count=post["activation_count"])
+            self._cache_bump(
+                bucket_id,
+                last_active=post["last_active"],
+                activation_count=post["activation_count"],
+                file_path=file_path,
+            )
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -1131,7 +1299,11 @@ class BucketManager:
                     # Store as float for fractional increments; calculate_score handles it
                     post["activation_count"] = round(current_count + _RIPPLE_BOOST, 1)
                     _atomic_write_text(file_path, frontmatter.dumps(post))
-                    self._cache_bump(bucket["id"], activation_count=post["activation_count"])
+                    self._cache_bump(
+                        bucket["id"],
+                        activation_count=post["activation_count"],
+                        file_path=file_path,
+                    )
                     rippled += 1
                 except Exception as _ripple_exc:
                     logger.warning(
@@ -1164,6 +1336,7 @@ class BucketManager:
         domain_filter: Optional[list[str]] = None,
         query_valence: Optional[float] = None,
         query_arousal: Optional[float] = None,
+        vector_scores: Optional[dict[str, float]] = None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -1204,8 +1377,19 @@ class BucketManager:
         #     只要查询命中过任意向量，就会被整体过滤掉 → breath 检索数对不上 pulse。
         # 修复：保留 vector_scores 给 Layer 2 的 semantic 维度用，但不动 candidates。
         # 没 embedding 的桶 semantic_score=0，仍可凭 topic/emotion/time/importance 命中。
-        vector_scores: dict[str, float] = {}
-        if self.embedding_engine and self.embedding_engine.enabled:
+        # ``None`` means this caller wants BucketManager to query the engine.
+        # An explicit dict (including {}) lets an orchestration layer perform
+        # the query once and reuse the same scores for ranking and recall.
+        vector_scores_provided = vector_scores is not None
+        if vector_scores is None:
+            vector_scores = {}
+        else:
+            vector_scores = dict(vector_scores)
+        if (
+            not vector_scores_provided
+            and self.embedding_engine
+            and self.embedding_engine.enabled
+        ):
             try:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=_VECTOR_TOPK)
                 if vector_results:
@@ -1276,8 +1460,8 @@ class BucketManager:
                 )
                 # Dim 6: semantic similarity — only when embedding is available (iter 2.1)
                 # 仅 embedding 可用时加入语义相似度维度；不可用时不影响 weight_sum 平衡
-                if vector_scores:
-                    semantic_score = vector_scores.get(bucket["id"], 0.0)
+                semantic_score = vector_scores.get(bucket["id"])
+                if semantic_score is not None:
                     total += semantic_score * self.w_semantic
                     weight_sum += self.w_semantic
                 # Dim 7: BM25 TF-IDF 关键词分（rank_bm25+jieba，软依赖，缺包时 bm25_scores={}）
@@ -1296,12 +1480,21 @@ class BucketManager:
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 # remain reachable by keyword (penalty applied only to ranking).
-                if normalized >= self.fuzzy_threshold or literal_hit:
+                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                semantic_match = (
+                    semantic_score is not None
+                    and semantic_score >= _VECTOR_RECALL_THRESHOLD
+                )
+                if text_match or semantic_match:
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):
                         normalized *= _RESOLVED_RANK_PENALTY
                     bucket["score"] = round(normalized, 2)
+                    if semantic_match and not text_match:
+                        bucket["vector_match"] = True
+                    else:
+                        bucket.pop("vector_match", None)
                     scored.append(bucket)
             except Exception as e:
                 logger.warning(
@@ -1440,27 +1633,54 @@ class BucketManager:
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
         """
-        # 活跃桶集走缓存（不含 archive；archive 每次照旧读盘，量小且极少用）。
-        # 命中返回「每个桶浅拷贝」的新列表：顶层键（如 search 里写的 score/vector_match）
-        # 落在拷贝上、不污染缓存；metadata 为共享引用，热路径读取前都会先 dict 拷贝再改，
-        # 故不会回写缓存（见 search.py 的 clean_meta）。
-        if not include_archive and self._active_cache is not None:
-            return [dict(b) for b in self._active_cache]
-
-        buckets = []
-        dirs = list(self._active_dirs)
         if include_archive:
-            dirs.append(self.archive_dir)
+            buckets = []
+            dirs = list(self._active_dirs) + [self.archive_dir]
+            for _root, _fname, file_path in self._iter_md_files(dirs):
+                bucket = self._load_bucket(file_path)
+                if bucket:
+                    buckets.append(bucket)
+            return buckets
 
-        for _root, _fname, file_path in self._iter_md_files(dirs):
-            bucket = self._load_bucket(file_path)
-            if bucket:
-                buckets.append(bucket)
+        # Active buckets use a parsed cache, but Obsidian/Git/manual edits may
+        # bypass BucketManager. Periodically stat the Markdown files; parsing
+        # is only repeated when path/mtime/size changed.
+        async with self._active_cache_lock:
+            previous_cache: list[dict] | None = None
+            now = time.monotonic()
+            if self._active_cache is not None:
+                poll_due = (
+                    self.external_change_poll_seconds == 0
+                    or now - self._last_file_state_check
+                    >= self.external_change_poll_seconds
+                )
+                if not poll_due:
+                    return [dict(bucket) for bucket in self._active_cache]
 
-        if not include_archive:
-            self._active_cache = [dict(b) for b in buckets]
+                current_state = self._scan_active_file_state()
+                self._last_file_state_check = now
+                if current_state == self._active_file_state:
+                    return [dict(bucket) for bucket in self._active_cache]
 
-        return buckets
+                previous_cache = [dict(bucket) for bucket in self._active_cache]
+                self._active_cache = None
+                self._bm25_dirty = True
+                self._external_changes_detected += 1
+                self._last_external_change = now_iso()
+
+            buckets = []
+            for _root, _fname, file_path in self._iter_md_files(self._active_dirs):
+                bucket = self._load_bucket(file_path)
+                if bucket:
+                    buckets.append(bucket)
+
+            self._active_cache = [dict(bucket) for bucket in buckets]
+            self._active_file_state = self._scan_active_file_state()
+            self._last_file_state_check = time.monotonic()
+            if previous_cache is not None:
+                self._reconcile_external_changes(previous_cache, buckets)
+
+            return buckets
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)

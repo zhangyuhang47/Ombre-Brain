@@ -5390,6 +5390,17 @@ async function refreshEmbInfo() {
       metaTxt = 'embeddings.db 元数据：model=' + dbModel + ' / dim=' + dbDim;
       if (mismatch) metaTxt += '  ' + _SV.warn + ' 与当前后端不一致，建议触发迁移';
     }
+    var queue = d.outbox || null;
+    if (queue) {
+      if (metaTxt) metaTxt += '<br>';
+      metaTxt += '后台索引队列：待处理 ' + (queue.pending || 0)
+        + ' · 重试中 ' + (queue.retrying || 0);
+      var circuit = queue.circuit || {};
+      if (circuit.state === 'open') {
+        metaTxt += ' · <span style="color:var(--negative,#c33)">' + _SV.warn
+          + ' 供应商熔断（连续失败 ' + (circuit.consecutive_failures || 0) + ' 次）</span>';
+      }
+    }
     document.getElementById('emb-info-meta').innerHTML = metaTxt;
   } catch (e) {
     // ignore
@@ -5461,6 +5472,11 @@ function _renderBackfillStatus(s) {
     var pct = tot > 0 ? Math.floor(((s.done + s.failed) / tot) * 100) : 0;
     html = '补齐中：<b>' + (s.done + s.failed) + ' / ' + tot + '</b> (' + pct + '%)'
       + ' · 成功 ' + s.done + ' · 失败 ' + (s.failed || 0);
+  } else if (s.status === 'queued') {
+    html = '<b style="color:var(--positive,#2a8)">' + _SV.ok + ' 已交给后台索引队列：</b>'
+      + '待处理 ' + (s.missing || 0) + ' · 本次新加入 ' + (s.queued || 0)
+      + (s.failed ? ' · <span style="color:var(--negative,#c33)">重试中 ' + s.failed + '</span>' : '')
+      + '<br><span style="color:var(--text-light)">记忆原文已安全保存；即使网络暂时不可用，服务也会继续重试。</span>';
   } else if (s.status === 'done') {
     if ((s.missing || 0) === 0) {
       html = '<b style="color:var(--positive,#2a8)">' + _SV.ok + ' 全部桶都有向量，无需补齐。</b>';
@@ -7381,7 +7397,10 @@ function renderMigrateParsed(d) {
   const currentModel = d.current_model || '（未知）';
   const hasEmb = d.has_embeddings;
 
-  let infoHtml = `解析到 <strong>${d.total_buckets}</strong> 个 bucket。`;
+  let infoHtml = d.integrity_verified
+    ? `<span style="color:var(--positive)">${_SV.ok} 备份清单与 SHA-256 校验通过。</span> `
+    : `<span style="color:var(--negative)">${_SV.warn} ${esc(d.integrity_warning || '旧版备份没有完整性清单，无法确认是否齐全。')}</span> `;
+  infoHtml += `解析到 <strong>${d.total_buckets}</strong> 个 bucket。`;
   if (hasEmb) {
     if (embMatch) {
       infoHtml += ` <span style="color:var(--positive)">${_SV.ok} Embedding 模型一致（${esc(importModel)}），向量数据将一并导入。</span>`;

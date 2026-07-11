@@ -20,8 +20,7 @@ import pytest_asyncio
 
 
 class _FakeEmbeddingEngine:
-    """embedding 现在是 create()/update(content=...) 的强制依赖；这里的
-    测试不验证 embedding 本身，给一个永远成功的假引擎。"""
+    """这里不验证 embedding 本身，给一个永远成功的假引擎。"""
 
     enabled = True
 

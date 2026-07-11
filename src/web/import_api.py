@@ -14,11 +14,9 @@ web/import_api.py — 宿主机 vault 设置 / 历史对话导入 / 桶编辑 / 
 """
 
 import os
-import io
-import json as _json_lib
 import time
 import asyncio
-import zipfile
+from datetime import datetime as _dt
 
 from starlette.requests import Request
 from starlette.responses import Response
@@ -29,6 +27,11 @@ try:
     from utils import parse_bool  # type: ignore
 except ImportError:  # pragma: no cover
     from ..utils import parse_bool  # type: ignore
+
+try:
+    from backup_archive import BackupArchiveError, build_export_archive  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..backup_archive import BackupArchiveError, build_export_archive  # type: ignore
 
 logger = sh.logger
 
@@ -464,7 +467,7 @@ def register(mcp) -> None:
 
     # =============================================================
     # /api/export  — 完整记忆打包导出
-    # 导出内容：所有 bucket markdown + embeddings.db + export_meta.json（含 embedding 模型信息）
+    # 导出内容：所有 bucket markdown + SQLite 一致性快照 + meta + SHA-256 清单
     # 不导出 config（避免 api_key 等密钥泄露）
     # export_meta.json 中的 embedding 字段供导入端检查模型一致性。
     # =============================================================
@@ -475,74 +478,52 @@ def register(mcp) -> None:
         if err:
             return err
 
-        import io
-        import zipfile
-
         buckets_dir = sh.config.get("buckets_dir", "")
         if not buckets_dir or not os.path.isdir(buckets_dir):
             return JSONResponse({"error": f"buckets_dir not found: {buckets_dir}"}, status_code=500)
 
-        buf = io.BytesIO()
         try:
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                # 1) bucket markdowns
-                for root, _dirs, files in os.walk(buckets_dir):
-                    for fn in files:
-                        if not fn.endswith(".md"):
-                            continue
-                        full = os.path.join(root, fn)
-                        rel = os.path.relpath(full, buckets_dir)
-                        arc = os.path.join("buckets", rel)
-                        try:
-                            zf.write(full, arc)
-                        except Exception as e:
-                            logger.warning(f"export: skip {full}: {e}")
+            emb_backend = getattr(sh.embedding_engine, "_backend", None)
+            try:
+                emb_dim = int(emb_backend.vector_dim()) if emb_backend else 0
+            except Exception:
+                emb_dim = 0
+            meta: dict = {
+                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "version": sh.version,
+                "embedding": {
+                    "model": str(getattr(sh.embedding_engine, "model", "") or ""),
+                    "dim": emb_dim,
+                    "backend": str(getattr(sh.embedding_engine, "backend", "") or ""),
+                },
+            }
+            try:
+                meta["stats"] = await sh.bucket_mgr.get_stats()
+            except Exception as exc:
+                logger.warning("export: stats unavailable: %s", exc)
 
-                # 2) embeddings.db（如果存在）
-                emb_path = sh.embedding_engine.db_path if hasattr(sh.embedding_engine, "db_path") else None
-                if emb_path and os.path.isfile(emb_path):
-                    try:
-                        zf.write(emb_path, "embeddings.db")
-                    except Exception as e:
-                        logger.warning(f"export: skip embeddings.db: {e}")
-
-                # 3) export_meta.json — 包含 embedding 模型信息，供导入端检查模型一致性
-                # 不包含 config（避免泄露 api_key 等密钥）
-                try:
-                    from datetime import datetime as _dt
-                    _emb_backend = getattr(sh.embedding_engine, "_backend", None)
-                    _emb_model = str(getattr(sh.embedding_engine, "model", "") or "")
-                    try:
-                        _emb_dim = int(_emb_backend.vector_dim()) if _emb_backend else 0
-                    except Exception:
-                        _emb_dim = 0
-                    _emb_be_name = str(getattr(sh.embedding_engine, "backend", "") or "")
-                    meta: dict = {
-                        "exported_at": _dt.now().isoformat(timespec="seconds"),
-                        "version": sh.version,
-                        "embedding": {
-                            "model": _emb_model,
-                            "dim": _emb_dim,
-                            "backend": _emb_be_name,
-                        },
-                    }
-                    # stats 失败时不影响 meta 写入（测试环境 mock 对象无法序列化）
-                    try:
-                        meta["stats"] = await sh.bucket_mgr.get_stats()
-                    except Exception:
-                        pass
-                    zf.writestr("export_meta.json", _json_lib.dumps(meta, ensure_ascii=False, indent=2))
-                except Exception as e:
-                    logger.warning(f"export: meta failed: {e}")
+            emb_path = str(getattr(sh.embedding_engine, "db_path", "") or "")
+            payload, manifest = await asyncio.to_thread(
+                build_export_archive,
+                buckets_dir,
+                emb_path,
+                meta,
+            )
+        except BackupArchiveError as e:
+            return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
         except Exception as e:
+            logger.error("export failed", exc_info=True)
             return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
 
-        buf.seek(0)
         fname = f"ombre_export_{int(time.time())}.zip"
         return StreamingResponse(
-            iter([buf.getvalue()]),
+            iter([payload]),
             media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{fname}"',
+                "X-Ombre-Backup-Verified": "true",
+                "X-Ombre-Backup-Files": str(manifest["file_count"]),
+            },
         )
 
 

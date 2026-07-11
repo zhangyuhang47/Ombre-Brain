@@ -1,3 +1,4 @@
+import asyncio
 import os
 from unittest.mock import MagicMock
 
@@ -51,12 +52,23 @@ class SearchPolicyBucketManager:
         base.update(metadata)
         return {"id": bucket_id, "content": content, "metadata": base}
 
-    async def search(self, query, limit=20, domain_filter=None, query_valence=None, query_arousal=None):
+    async def search(
+        self,
+        query,
+        limit=20,
+        domain_filter=None,
+        query_valence=None,
+        query_arousal=None,
+        vector_scores=None,
+    ):
         assert query == "query"
         return list(self.buckets)
 
     async def touch(self, bucket_id):
         self.touched.append(bucket_id)
+
+    async def touch_many(self, bucket_ids, ripple=False):
+        self.touched.extend(bucket_ids)
 
     async def list_all(self, include_archive=False):
         return []
@@ -112,16 +124,13 @@ async def test_default_breath_respects_dont_surface_even_for_core_bucket(bucket_
 
 
 @pytest.mark.asyncio
-async def test_search_breath_rejects_when_embedding_unavailable_even_if_dehydrate_fails(
+async def test_search_breath_falls_back_when_embedding_and_dehydrate_are_unavailable(
     bucket_mgr,
     decay_eng,
     monkeypatch,
 ):
-    """embedding 是 breath(query=...) 的强制依赖：未启用时直接拒绝整个检索，
-    不再像旧版那样靠 dehydrate 失败回退原文继续返回结果（rule.md §1.5 的
-    「不静默」现在延伸为「不降级」，见 bucket_manager._require_embedding_available）。
-    """
-    await bucket_mgr.create(
+    """主动检索的两个派生服务都离线时，Markdown 原文仍然可读。"""
+    bucket_id = await bucket_mgr.create(
         content="Candlelit protocol belongs to the permanent rules.",
         bucket_type="permanent",
         importance=10,
@@ -133,16 +142,20 @@ async def test_search_breath_rejects_when_embedding_unavailable_even_if_dehydrat
 
     monkeypatch.setattr(search_mod.random, "random", lambda: 1.0)
 
-    with pytest.raises(RuntimeError, match="embedding"):
-        await surface_search(
-            query="Candlelit protocol",
-            max_results=10,
-            max_tokens=10000,
-            domain="",
-            valence=-1,
-            arousal=-1,
-            tag_filter=[],
-        )
+    result = await surface_search(
+        query="Candlelit protocol",
+        max_results=10,
+        max_tokens=10000,
+        domain="",
+        valence=-1,
+        arousal=-1,
+        tag_filter=[],
+    )
+
+    assert bucket_id in result
+    assert "Candlelit protocol" in result
+    assert "语义索引暂不可用" in result
+    assert "摘要服务暂不可用" in result
 
 
 @pytest.mark.asyncio
@@ -163,6 +176,7 @@ async def test_search_breath_filters_terminal_states_but_keeps_dont_surface(deca
         arousal=-1,
         tag_filter=[],
     )
+    await asyncio.sleep(0)
 
     assert "Visible query memory" in result
     assert "Hidden query memory" in result

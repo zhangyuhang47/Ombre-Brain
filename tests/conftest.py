@@ -128,12 +128,9 @@ def buggy_config(tmp_path):
 class FakeEmbeddingEngine:
     """最小化可用的 embedding 引擎替身。
 
-    embedding 现在是 bucket_manager.create()/update(content=...) 的强制
-    依赖（未启用/调用失败直接拒绝写入，不再降级）。大多数测试要验证的是
-    其他逻辑（评分/衰减/检索过滤等），不是「embedding 该不该拒绝」本身，
-    所以默认 bucket_mgr fixture 配一个永远成功的 fake，让这些测试能正常
-    创建桶。需要测试「embedding 不可用时确实拒绝」的用例，应单独构造一个
-    enabled=False 或会抛异常的 fake，不要依赖这个默认 fixture。
+    Markdown 是写入真源，embedding 是可重建的派生索引。大多数测试要验证
+    评分/衰减/检索等逻辑，所以默认 bucket_mgr fixture 配一个永远成功的
+    fake；离线写入与后台重试契约在 test_embedding_outbox.py 单独覆盖。
     """
 
     enabled = True

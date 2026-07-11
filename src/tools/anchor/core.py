@@ -80,17 +80,37 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
     # 让她/他/模型立刻知道「数对不上是真 bug」而不是错觉。
     try:
         ee = getattr(rt, "embedding_engine", None)
+        outbox = getattr(rt.bucket_mgr, "embedding_outbox", None)
+        pending_ids = outbox.pending_ids() if outbox is not None else set()
+        if outbox is not None:
+            queue_state = outbox.status()
+            circuit = queue_state.get("circuit") or {}
+            status += (
+                f"向量索引队列: 待处理 {queue_state['pending']} 个"
+                f"（重试中 {queue_state['retrying']} 个）"
+                + (
+                    f"，供应商熔断中（连续失败 "
+                    f"{circuit.get('consecutive_failures', 0)} 次）"
+                    if circuit.get("state") == "open" else ""
+                )
+                + "\n"
+            )
         if ee and getattr(ee, "enabled", False):
             disk_buckets = await rt.bucket_mgr.list_all(include_archive=True)
-            disk_ids = {b["id"] for b in disk_buckets}
+            disk_ids = {
+                b["id"] for b in disk_buckets
+                if not (b.get("metadata") or {}).get("deleted_at")
+                and str(b.get("content") or "").strip()
+            }
             index_ids = set(ee.list_all_ids())
-            missing = disk_ids - index_ids
+            missing = disk_ids - index_ids - pending_ids
             orphan = index_ids - disk_ids
             if missing or orphan:
                 status += (
                     f"⚠️ 索引漂移：缺失 embedding {len(missing)} 个 / "
                     f"孤儿 embedding {len(orphan)} 个 "
-                    f"（运行 tools/backfill_embeddings.py 与 tools/clean_orphan_embeddings.py 可修复）\n"
+                    f"（缺失项可在 Dashboard 触发补齐；孤儿项可运行 "
+                    f"tools/clean_orphan_embeddings.py 清理）\n"
                 )
     except Exception as e:
         rt.logger.warning(f"pulse index/storage drift check failed: {e}")

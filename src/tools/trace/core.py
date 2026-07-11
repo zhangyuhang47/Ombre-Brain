@@ -170,7 +170,7 @@ async def trace_core(
         return f"修改失败: {bucket_id}"
 
     # 注意：bucket_mgr.update() 在 "content" in kwargs 时已经内部调用
-    # _sync_embedding() 重新生成并写入向量（见 bucket_manager.py），这里不需要
+    # update(content=...) 会投递 embedding outbox（见 bucket_manager.py），这里不需要
     # 也不应该重复调用 generate_and_store，否则同一条内容会多打一次向量 API。
 
     # --- plan 桶人工/AI 显式 resolve → 联动 related_bucket / resolved_by ---

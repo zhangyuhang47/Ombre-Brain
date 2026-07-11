@@ -48,6 +48,11 @@ hooks:
 # 保持默认则使用内置的 ./buckets/ 目录
 # buckets_dir: "/path/to/your/Obsidian Vault/Ombre Brain"
 
+# Detect Markdown changes made outside OB (Obsidian / Git / manual edits).
+# Only file metadata is polled; Markdown is reparsed when a change is detected.
+storage:
+  external_change_poll_seconds: 1.0  # 0 = check every list; env: OMBRE_EXTERNAL_CHANGE_POLL_SECONDS
+
 # --- Merge threshold / 桶合并阈值 ---
 # When storing a new memory, if similarity with an existing bucket exceeds
 # this value (0-100), merge instead of creating a new one
@@ -93,6 +98,12 @@ decay:
 # 需要在环境变量中设置 OMBRE_EMBED_API_KEY。
 embedding:
   enabled: true                   # Enable embedding / 启用向量化
+  background_indexing: true       # Write Markdown first; index asynchronously / 先落盘，后台生成向量
+  retry_base_seconds: 5           # First retry delay after provider failure / 首次重试等待
+  retry_max_seconds: 300          # Exponential-backoff ceiling / 指数退避上限
+  circuit_failure_threshold: 3    # Consecutive failures before global pause / 连续失败几次后熔断
+  circuit_base_seconds: 30        # First global cooldown / 首次熔断冷却
+  circuit_max_seconds: 600        # Maximum global cooldown / 最长熔断冷却
   backend: "api"                  # 只支持 api（OpenAI 兼容端点）
   model: "gemini-embedding-001"   # 云端模型名（如 gemini-embedding-001）
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"

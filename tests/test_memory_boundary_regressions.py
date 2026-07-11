@@ -84,8 +84,10 @@ async def test_bucket_manager_hold_fallback_keeps_markdown_without_embedding(tmp
     assert bucket is not None
     assert bucket["content"] == original
 
-    with pytest.raises(RuntimeError, match="embedding"):
-        await manager.create(content="grow 仍应严格要求向量")
+    grow_id = await manager.create(content="grow 也应先保留原文")
+    grow_bucket = await manager.get(grow_id)
+    assert grow_bucket is not None
+    assert grow_bucket["content"] == "grow 也应先保留原文"
 
 
 @pytest.mark.asyncio

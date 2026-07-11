@@ -383,6 +383,23 @@ class DecayEngine:
         （防打爆 API），剩余下一轮继续；单条失败仅 warning（rule.md §1.5 允许降级）。
         只处理活跃桶（buckets 不含 archive），不在此删孤儿向量（删除走专用脚本，
         避免把 archive 桶的有效向量误判为孤儿）。"""
+        outbox = getattr(self.bucket_mgr, "embedding_outbox", None)
+        if outbox is not None and getattr(outbox, "running", False):
+            try:
+                queued = await outbox.reconcile(
+                    buckets=buckets,
+                    include_archive=False,
+                )
+                if queued:
+                    logger.info(
+                        "Decay self-heal queued / 衰减自愈已加入向量队列: %s 条",
+                        queued,
+                    )
+                return queued
+            except Exception as e:
+                logger.warning(f"self-heal embeddings: 投递后台队列失败: {e}")
+                return 0
+
         ee = getattr(self.bucket_mgr, "embedding_engine", None)
         if not ee or not getattr(ee, "enabled", False):
             return 0
@@ -397,8 +414,8 @@ class DecayEngine:
         healed = 0
         for b in missing[:_BACKFILL_MAX_PER_CYCLE]:
             try:
-                await ee.generate_and_store(b["id"], b["content"])
-                healed += 1
+                if await ee.generate_and_store(b["id"], b["content"]):
+                    healed += 1
             except Exception as e:
                 logger.warning(f"self-heal embeddings: 补 {b['id']} 失败: {e}")
         if healed:

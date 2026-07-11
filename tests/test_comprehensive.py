@@ -223,8 +223,7 @@ def bm_config(tmp_path):
 
 
 class _FakeEmbeddingEngine:
-    """最小化可用替身：embedding 现在是 create()/update(content=...) 的
-    强制依赖，这里的测试不验证 embedding 本身，给一个永远成功的假引擎。
+    """最小化可用替身：这里不验证 embedding 本身，给一个永远成功的假引擎。
     （与 conftest.FakeEmbeddingEngine 同构但不跨文件 import——pytest 在
     tests/ 是 package 的布局下，`from conftest import ...` 容易因为
     sys.path 解析顺序在某些调用方式下找不到模块，保留各文件本地定义更稳妥。）

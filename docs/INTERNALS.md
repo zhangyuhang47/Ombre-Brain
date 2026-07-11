@@ -115,7 +115,9 @@ Ombre-Brain/
 - **embedding_engine.py** — 「门面 + 后端」两层向量化：后端只有**一个 OpenAI 兼容 API 实现**（默认 Gemini 云端）；门面负责 SQLite 存取、余弦搜索、孤儿对账、模型/维度一致性校验（不一致记 OB-W005，不阻止启动）。**本地离线向量化**不是另一个后端，而是把 `base_url` 指向 OB 托管的 Ollama 边车（bge-m3，由 `web/ollama_local.py` 拉起子进程）。旧文档的「bge-small-zh / sentence-transformers 懒加载」已废弃。
 - **bm25_index.py** — BM25 稀疏检索（jieba 中文分词），给 `bucket_manager.search()` 提供 TF-IDF 加权的关键词召回（Dim 7）。`rank_bm25` / `jieba` 是软依赖，未装则静默 no-op，不影响其余维度；索引由 BucketManager 持有，写后脏标记、search 时懒重建。
 - **import_memory.py** — Claude JSON / ChatGPT / DeepSeek / Markdown / 纯文本五种格式的历史对话导入，分块处理 + 断点续传 + 词频规律检测。
-- **migrate_engine.py** — 完整记忆包导入：把 `/api/export` 产生的 zip（buckets/*.md + embeddings.db + export_meta.json）增量 merge 进当前系统；识别 ID 冲突（skip/overwrite/keep_both），embedding 模型不一致时只导 md 再重算。
+- **backup_archive.py** — 本地备份格式：读取 Markdown、用 SQLite backup API 生成一致性快照、写 `backup_manifest.json`（逐文件 size + SHA-256）；导入前限制 ZIP 文件数/体积/压缩率并拒绝路径穿越、重复路径、损坏清单。
+- **migrate_engine.py** — 完整记忆包导入：把 `/api/export` 产生的 zip 增量 merge 进当前系统；识别 ID 冲突（skip/overwrite/keep_both），兼容新旧 embedding schema。模型不一致或快照缺向量时写入耐久 outbox，不把网络调用放在恢复事务里。旧版无清单包可兼容导入，但状态明确标记为未验证。
+- **vault_health.py** — Dashboard 与 `tools/check_buckets.py` 共用的只读健康检查：Markdown 解析、重复 ID、越界软链接、SQLite `quick_check`、孤儿向量、缺失且未进入 outbox 的向量。
 - **migration_engine.py** — embedding 后端切换（local ↔ api）时后台全量重算向量：先写 `embeddings.db.migrating`、跑完原子 swap；断点续传 + 失败跳过 + 进度文件供前端轮询。
 - **github_sync.py** — 把 `buckets_dir` 下的 .md 经 GitHub Git Trees API 批量提交做云端备份（不传 embeddings.db）；支持手动 + 定时自动同步。路由在 `web/github.py`。
 - **reclassify_api.py** — 一次性脚本：把历史落在「未分类/」的桶重新 `analyze()` 打标并搬到正确 domain 目录，只改 frontmatter 与文件位置。
@@ -180,7 +182,7 @@ src/web/
 
 ### 辅助脚本
 
-`tools/backfill_embeddings.py`（为存量桶补 embedding）、`src/write_memory.py`（CLI 直写记忆，绕过 MCP）、`tools/reclassify_domains.py` / `src/reclassify_api.py`（重新打标）、`tools/check_buckets.py`（数据完整性检查）、`tools/check_icloud_conflicts.py`（iCloud 同步冲突文件清理）。
+`tools/backfill_embeddings.py`（为存量桶补 embedding）、`src/write_memory.py`（CLI 直写记忆，绕过 MCP）、`tools/reclassify_domains.py` / `src/reclassify_api.py`（重新打标）、`tools/check_buckets.py`（数据完整性检查）、`tools/check_icloud_conflicts.py`（iCloud 同步冲突文件清理）、`tools/evaluate_retrieval.py`（用显式 query→bucket 期望只读计算 Hit@K / Recall@K / MRR，默认不调用 embedding）。
 
 ---
 
@@ -204,12 +206,15 @@ hold / grow（Claude 决策）
        bucket_mgr.search(content, limit=1, domain_filter)
               │
        score > merge_threshold(75)?
-        ├─ 是 → dehydrator.merge() → bucket_mgr.update() → 更新 embedding
-        └─ 否 → bucket_mgr.create() → embedding_engine.generate_and_store()
+        ├─ 是 → dehydrator.merge() → bucket_mgr.update()
+        └─ 否 → bucket_mgr.create()
               │
               ▼
        写入 buckets/dynamic/{domain}/{name}_{id}.md
        activation_count = 0   ← 关键：创建时为 0，touch() 才会变 1+
+              │
+              └─→ embedding outbox（只存 id + content hash）
+                        └─ 后台单 worker 生成向量；失败指数退避、重启后续跑
               │
               ▼
        存活期：每次 breath(query) 命中 → bucket_mgr.touch()
@@ -277,7 +282,7 @@ feel 桶自身：
 1. **Feel 通道**（`domain="feel"` 或 `tags` 含 `"feel"`/`"__feel__"`）：直接拉所有 `type==feel` 桶，按 `created` 倒序展示原文，按 `surfacing.feel_max_tokens`（默认 6000）做 token 预算；**超出预算的旧 feel 折叠为 60 字符单行摘要**，并在末尾追加 `更早的 feel 摘要（N 条，已折叠）` 段。**不排除 anchor 桶**（设计：feel 通道只看 type=feel）。
 2. **重要度批量模式**（`importance_min >= 1`）：跳过语义搜索，按 importance 降序返回 ≤20 条；过滤 `feel/plan/letter` 与 `dont_surface=True`；**不过滤 anchor、不过滤 pinned**（设计：主动按 importance 检索时希望能找到所有重要桶）。
 3. **浮现模式**（无 `query`）：钉选桶始终展示为「核心准则」+ 未解决桶按衰减分排序，**冷启动**（`activation_count==0 && importance>=8`）的桶最多 2 个插到最前；后续排序**有两条互斥路径**：当 `surfacing.sampling.enabled=true` 时走加权无放回采样（`top_k` / `sample_k` / `temperature` 控制；详见 §7.1），否则走原 Top-1 固定 + Top-2~20 随机洗牌；按 `max_results` 硬截断。**排除 anchor 桶**（设计：anchor 是坐标系，不该随机冒泡干扰日常浮现；这是浮现模式独有的过滤）。浮现**不调用** `touch()`。**末尾追加 `=== 久未浮现 ===`** 段（iter 1.6 §7 被动联想）：从 `activation_count==0 && importance>=8` 或 `importance>=9 && 距 last_active>7天` 的桶里随机抽 1~2 条，模拟「突然想起来」。
-4. **检索模式**（有 `query`）：四维加权评分 → 过滤 `feel/plan/letter`，**pinned/permanent 仍可被检索命中（不过滤），命中后加 📌 前缀** → 向量补充通道（相似度 > 0.5 标 `[语义关联]`）→ 情绪重构（valence 微调 ±0.1）→ 命中时 `touch()` → 结果不足 3 条时 40% 概率随机漂浮 1~3 条低权重旧桶。**不过滤 anchor**（设计：主动检索时希望能找到坐标系桶）。
+4. **检索模式**（有 `query`）：每个 query 只生成一次查询向量，与 rapidfuzz/BM25 多维评分共同进入 `BucketManager.search()` → 过滤 `feel/plan/letter`，**pinned/permanent 仍可被检索命中（不过滤），命中后加 📌 前缀** → 纯语义候选相似度 `>=0.65` 标 `[语义关联]`，且不能绕过 domain/tags/type 过滤 → 情绪重构（valence 微调 ±0.1）→ 命中时 `touch()` → 结果不足 3 条时 40% 概率随机漂浮 1~3 条低权重旧桶。embedding 不可用时明确提示后继续关键词/BM25；dehydrate 不可用时返回最多 300 字原文片段。**不过滤 anchor**（设计：主动检索时希望能找到坐标系桶）。
 
 (实现注意：`tags="feel"` 在第一个分支被映射为 `domain="feel"` 后清出 tag_filter；其它 tag 走 AND 过滤；`max_tokens` 上限 20000，`max_results` 上限 50；`importance_min` 模式下硬上限 20 条不可调；浮现模式中钉选桶**不计入** `max_results` 上限。)
 
@@ -288,7 +293,7 @@ feel 桶自身：
 两种路径：
 
 - **Feel 模式** (`feel=True`)：跳过 LLM 分析，自动注入 `__feel__` 标签，写入 `feel/沉淀物/`。`source_bucket` 提供时把源桶标记为 `digested=True` 并写 `model_valence`。返回 `🫧feel→{id}`。
-- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create(raw_merge=True)`（相似度 > `merge_threshold` 时以分隔线追加原文，否则新建）→ 写 embedding → 异步触发 `_check_plan_resolution()` 扫 active plans。返回 `合并→{name}` 或 `新建→{name}`。`analyze()` 或 embedding 不可用时只降级元数据/向量索引，正文仍原样落盘；**hold 永远不调 `dehydrate()`/`merge()` 压缩正文**。
+- **普通模式**：`analyze()` → 用户传入的 `valence`/`arousal` 优先于 LLM 结果（B-09 修复）→ `_merge_or_create(raw_merge=True)`（相似度 > `merge_threshold` 时以分隔线追加原文，否则新建）→ 原文落盘后投递 embedding outbox → 异步触发 `_check_plan_resolution()` 扫 active plans。返回 `合并→{name}` 或 `新建→{name}`。`analyze()` 或 embedding 不可用时只降级元数据/向量索引，正文仍原样落盘；**hold 永远不调 `dehydrate()`/`merge()` 压缩正文**。
 
 (改动注意：`pinned=True` 走单独分支直接创建到 `permanent/`，importance 强制锁 10，不走合并；用户显式传 valence/arousal=0.0 也算「有效」，必须走 `0 <= v <= 1` 判定，不能用 `if valence` 否则 0.0 会被忽略——这就是 B-09。)
 
@@ -432,8 +437,8 @@ feel 桶自身：
 | `/api/import/results` | GET | 🔒 | 已导入桶列表（含正文 300 字预览） |
 | `/api/import/review` | POST | 🔒 | 批量审阅（important / pin / noise / delete） |
 | `/api/bucket/{id}/edit` | PATCH/POST | 🔒 | iter 1.6 §6：Dashboard 编辑桶元数据（name/tags/domain/importance/resolved/pinned/digested/content）；走 §5 大小+pinned 配额 |
-| `/api/export` | GET | 🔒 | iter 1.6 §2：流式返回 zip（buckets/*.md + embeddings.db + export_meta.json）；**不包含 config / 密钥**；export_meta.json 含 embedding 模型信息，供导入端检查一致性 |
-| `/api/migrate/upload` | POST | 🔒 | 上传 zip 包，解析内容、识别 ID 冲突、检查 embedding 模型一致性；返回冲突列表，不实际写入 |
+| `/api/export` | GET | 🔒 | 返回可验证 zip：buckets/*.md + SQLite 一致性快照 + export_meta.json + backup_manifest.json；**不包含 config / 密钥**；任何源文件读取失败则整个导出失败，不产生“看似成功”的残缺包 |
+| `/api/migrate/upload` | POST | 🔒 | 上传 zip 包，先做 ZIP 安全边界与清单 SHA-256 校验，再解析内容、识别 ID 冲突、检查 embedding 模型/维度；返回冲突和 `integrity_verified`，不实际写入 |
 | `/api/migrate/status` | GET | 🔒 | 查询当前迁移任务状态（phase / 冲突列表 / 导入进度 / 重新向量化进度） |
 | `/api/migrate/apply` | POST | 🔒 | 执行导入，携带冲突决策 `{bucket_id: "skip"|"overwrite"|"keep_both"}`；异步执行，轮询 status 看进度 |
 | `/api/heartbeat` | GET | 🔒 | iter 1.6 §3：心跳（uptime / last_op_ts / decay 状态），Dashboard 右上角灯轮询 |
@@ -1302,7 +1307,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 3. 多维加权精排（topic / emotion / time / importance / touch [+ semantic] [+ bm25]）—— BM25 稀疏召回作为 Dim 7（`bm25_index.py`，软依赖未装则该维度 0 分）
 4. 截断到 `limit`
 
-(改动注意：iter 2.1+ 起 embedding 不再用作候选预筛。历史实现把候选集替换成「在 embeddings.db 里的桶」，导致缺失向量的桶在 breath 检索里整体消失，pulse 总数与 breath 命中数对不上。修复后没向量的桶 `semantic_score=0`，仍可凭 topic/emotion/time/importance 命中。索引一致性由 `bucket_manager.create()/update(content=...)` 自动 `_sync_embedding()` 维持；pulse 也会附带「索引漂移」告警。)
+(改动注意：iter 2.1+ 起 embedding 不再用作候选预筛。历史实现把候选集替换成「在 embeddings.db 里的桶」，导致缺失向量的桶在 breath 检索里整体消失，pulse 总数与 breath 命中数对不上。修复后没向量的桶 `semantic_score=0`，仍可凭 topic/emotion/time/importance 命中。现在 Markdown 是唯一写入真源；`bucket_manager.create()/update(content=...)` 落盘后把 id 与正文 hash 投递到 `.embedding_outbox.json`，后台单 worker 负责生成、失败重试和启动对账。`pulse` 会把“排队中”与真正的索引漂移分开显示。)
 
 ---
 
@@ -1435,7 +1440,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `2` | `breath` 浮现 | 冷启动桶数上限 |
 | `8` | 冷启动 | importance >= 8 才进入冷启动 |
 | `20` | `breath` 浮现 | top-1 固定 + top-2~20 随机 |
-| `0.5` | `breath` 检索 | 向量补充通道相似度下限 |
+| `0.65` | `breath` 检索 | 纯语义候选进入结果池的余弦相似度下限 |
 | `0.2` | `breath` 检索 | 情感重构系数 `(q_v - 0.5) × 0.2`，最大 ±0.1 |
 | `3` / `0.4` / `2.0` / `1~3` | `breath` 检索 | 随机漂浮触发条件 / 概率 / 池阈值 / 数量 |
 | `30` 字符 | `grow` | 短内容快速路径阈值 |
@@ -1467,24 +1472,25 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `breath` 浮现 | 桶目录空 | 返回「权重池平静，没有需要处理的记忆。」 |
 | `breath` 浮现 | `list_all` 异常 | 返回「记忆系统暂时无法访问。」 |
 | `breath` 检索 | `search` 异常 | 返回「检索过程出错，请稍后重试。」 |
-| `breath` 检索 | embedding 不可用 | WARNING 日志，跳过向量通道，仅 keyword |
+| `breath` 检索 | embedding 不可用 / 查询失败 | 明确附加「检索降级」提示，跳过向量通道，继续 rapidfuzz + BM25 |
+| `breath` 检索展示 | dehydrate 不可用 / 返回空 | 明确附加「展示降级」提示，返回最多 300 字原文片段 |
 | `breath` 检索 | 结果 < 3 | 40% 概率随机漂浮 1~3 条低权重旧桶 |
-| `hold` `analyze` 失败 | API 异常 | **直接 RuntimeError**，不创建桶，返回「API key 未配置或调用失败，打标无法完成，桶未创建。请检查 OMBRE_COMPRESS_API_KEY。」 |
+| `hold` `analyze` 失败 | API 异常 | 正文逐字落盘，元数据使用本地中性默认值并明确提示；绝不压缩正文 |
 | `hold` 合并搜索失败 | search 异常 | 直接走新建路径 |
 | `hold` 合并融合失败 | merge 异常 | 直接走新建路径 |
-| `hold` embedding | API 异常 / 未配置 | 桶仍创建成功，返回值追加「向量化失败，该桶不参与语义检索，仅支持关键词匹配。请检查 OMBRE_EMBED_API_KEY。」 |
+| `hold` embedding | API 异常 / 未配置 | 桶先创建成功，任务留在耐久 outbox；后台恢复后自动补齐 |
 | `grow` digest 失败 | API 异常 | **直接 RuntimeError**，不创建任何桶，返回「API key 未配置或调用失败，日记拆分无法完成，桶未创建。请检查 OMBRE_COMPRESS_API_KEY。」 |
 | `grow` 单条失败 | 单 item 异常 | 标 `⚠️条目名`，其它继续 |
 | `grow` 短内容 (<30 字) | — | 跳过 digest 走 hold 单条 |
 | `trace` 桶不存在 | get None | 返回「未找到记忆桶: {id}」 |
 | `trace` 无字段变更 | — | 返回「没有任何字段需要修改。」 |
-| `dehydrator.dehydrate` API 不可用 | `api_available=False` | **直接 RuntimeError，不静默降级** |
+| `dehydrator.dehydrate` API 不可用 | `api_available=False` | 方法本身抛 RuntimeError；`breath(query=...)` 在展示边界捕获并回退原文片段 |
 | `embedding.search_similar` 未启用 | enabled=False | 返回 `[]`，调用方 fallback |
 | `_check_plan_resolution` 无 embedding | — | 整体跳过（保守，不误报） |
 | `decay_cycle` list_all 失败 | 异常 | 返回 `{checked:0, error:str}`，不终止后台循环 |
 | `decay_cycle` 单桶评分失败 | 异常 | WARNING 日志，跳过该桶 |
 
-**核心设计决策（不要轻改）**：脱水/打标 API 不可用时**直接报错**而非本地降级。理由：本地关键词提取的语义质量不足以替代 LLM 打标，静默降级会产生错误分类的记忆，比直接报错更危险。
+**核心设计决策（不要轻改）**：派生服务不能决定 Markdown 原文是否存在。`hold` 打标失败时使用明确标注的中性元数据保留原文；`breath` 摘要失败时显示受长度限制的原文片段；需要 LLM 做结构化拆分的 `grow` 长内容仍可显式报错。所有降级都必须对调用方可见，不能伪装成完整语义结果。
 
 ---
 
@@ -1524,7 +1530,7 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | 检索结果排序看着不对 | `bucket_manager.py` | `search()` Layer 2 + `_calc_topic_score / _calc_emotion_score / _calc_time_score` |
 | 关键词明明在桶名里却没命中 | `bucket_manager.py` | `_calc_topic_score`（rapidfuzz partial_ratio 阈值）+ `fuzzy_threshold` 配置 |
 | resolved 桶完全搜不到 | `bucket_manager.py` | `search()` 阈值检查应该用 normalized 原始值，× 0.3 只在通过阈值后；旧版 B-01 行为 |
-| 向量搜索没生效 | `embedding_engine.py` | `enabled` 是否为 True；`search_similar` 是否抛异常被 server.py 捕获 |
+| 向量搜索没生效 | `embedding_engine.py` + `tools/breath/search.py` | `enabled` 是否为 True；`search_similar_strict` 是否触发降级提示；用 `tools/evaluate_retrieval.py --with-embedding` 对比基线 |
 | 向量后端切换不生效 | `web/config_api.py` | `/api/config` POST 中 embedding.backend 分支必须 `EmbeddingEngine(config)` 完整重建 |
 | `breath(domain="feel")` 返回空但有 feel 桶 | `bucket_manager.py` | `list_all()` `dirs` 列表必须含 `self.feel_dir` |
 | Top-1 永远是同一个桶 | `tools/breath/` | 浮现分支 `top1` 固定逻辑；想加多样性需改成 sampling |

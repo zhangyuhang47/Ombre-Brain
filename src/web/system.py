@@ -12,6 +12,7 @@ web/system.py — 心跳 / 日志 / 错误码面板
 """
 
 import ast
+import asyncio
 import os
 import time
 from typing import Any
@@ -52,6 +53,11 @@ try:
     from utils import parse_bool  # type: ignore
 except ImportError:  # pragma: no cover
     from ..utils import parse_bool  # type: ignore
+
+try:
+    from vault_health import inspect_vault  # type: ignore
+except ImportError:  # pragma: no cover
+    from ..vault_health import inspect_vault  # type: ignore
 
 _LOGS_DEFAULT_LIMIT = 200
 _LOGS_MAX_LIMIT = 2000
@@ -578,6 +584,13 @@ async def build_system_diagnostics() -> dict[str, Any]:
     buckets_dir = str(cfg.get("buckets_dir") or "").strip()
     writable, storage_error = _probe_writable_dir(buckets_dir)
     persistence = sh.data_dir_persistence(buckets_dir)
+    external_change_status = {}
+    external_status_fn = getattr(sh.bucket_mgr, "external_change_status", None)
+    if callable(external_status_fn):
+        try:
+            external_change_status = external_status_fn()
+        except Exception:
+            external_change_status = {}
     if not writable:
         storage_status = "error"
         storage_msg = f"数据目录不可用：{storage_error}"
@@ -602,6 +615,7 @@ async def build_system_diagnostics() -> dict[str, Any]:
             "persistent": persistence["persistent"],
             "persistence_mode": persistence["mode"],
             "persistence_note": persistence["note"],
+            "external_changes": external_change_status,
         },
         action=storage_action,
     ))
@@ -1087,17 +1101,46 @@ async def build_system_diagnostics() -> dict[str, Any]:
     emb_runtime_enabled = bool(getattr(emb_engine, "enabled", False))
     emb_backend = getattr(emb_engine, "_backend", None)
     emb_db_path = str(getattr(emb_engine, "db_path", "") or "")
+    emb_outbox = sh.embedding_outbox
+    emb_queue = emb_outbox.status() if emb_outbox is not None else None
+    emb_pending = int((emb_queue or {}).get("pending") or 0)
+    emb_circuit = (emb_queue or {}).get("circuit") or {}
     if not emb_enabled_cfg:
         emb_status = "error"
-        emb_message = "向量化已关闭，语义检索不可用"
+        emb_message = "向量化已关闭，语义检索不可用；记忆原文仍可正常写入"
         emb_action = "开启 embedding 并配置云端 Key 或本地 Ollama"
     elif not emb_runtime_enabled or emb_backend is None:
         emb_status = "error"
-        emb_message = "向量化已开启但运行时仍在待机，通常是 Embedding API Key 或本地模型未就绪"
+        emb_message = (
+            "向量化运行时仍在待机、尚未就绪；记忆原文仍会保存，"
+            f"当前有 {emb_pending} 条向量等待重试"
+        )
         emb_action = "填写 Embedding API Key 后保存，或完成本地 bge-m3 安装"
+    elif (
+        emb_queue
+        and emb_queue.get("background_enabled")
+        and not emb_queue.get("running")
+    ):
+        emb_status = "warning"
+        emb_message = f"向量化可用，但后台索引队列未运行（待处理 {emb_pending} 条）"
+        emb_action = "重启服务以恢复后台索引队列"
+    elif emb_circuit.get("state") == "open":
+        emb_status = "warning"
+        emb_message = (
+            f"向量供应商连续失败，后台已熔断保护（待处理 {emb_pending} 条，"
+            f"连续失败 {int(emb_circuit.get('consecutive_failures') or 0)} 次）"
+        )
+        emb_action = "检查网络/额度；恢复后点击“补齐缺失向量”可立即重试"
+    elif emb_pending:
+        emb_status = "warning"
+        emb_message = (
+            f"向量化运行时已就绪，后台尚有 {emb_pending} 条待处理"
+            f"（重试中 {int((emb_queue or {}).get('retrying') or 0)} 条）"
+        )
+        emb_action = "无需阻塞写入；若长时间不下降，请检查网络、额度和错误日志"
     else:
         emb_status = "ok"
-        emb_message = "向量化运行时已就绪"
+        emb_message = "向量化运行时已就绪，后台索引队列为空"
         emb_action = ""
     checks.append(_check(
         "embedding",
@@ -1113,8 +1156,54 @@ async def build_system_diagnostics() -> dict[str, Any]:
             "db_path": emb_db_path,
             "db_exists": bool(emb_db_path and os.path.exists(emb_db_path)),
             "timeout_seconds": emb_cfg.get("timeout_seconds", 30),
+            "outbox": emb_queue,
         },
         action=emb_action,
+    ))
+
+    pending_ids = set()
+    pending_fn = getattr(emb_outbox, "pending_ids", None)
+    if callable(pending_fn):
+        try:
+            pending_ids = pending_fn()
+        except Exception:
+            pending_ids = set()
+    integrity = await asyncio.to_thread(
+        inspect_vault,
+        buckets_dir,
+        emb_db_path,
+        pending_ids,
+    )
+    integrity_status = integrity["status"]
+    markdown_health = integrity["markdown"]
+    sqlite_health = integrity["sqlite"]
+    if integrity_status == "error":
+        integrity_message = (
+            "记忆源文件或向量库完整性检查失败："
+            f"解析错误 {markdown_health['parse_error_count']}，"
+            f"重复 ID {markdown_health['duplicate_id_count']}，"
+            f"SQLite {'正常' if sqlite_health['quick_check_ok'] else '异常'}"
+        )
+        integrity_action = "先导出可读 Markdown，再按详情修复损坏文件或重建 embeddings.db"
+    elif integrity_status == "warning":
+        integrity_message = (
+            f"记忆原文完整；孤儿向量 {sqlite_health['orphan_count']} 条，"
+            f"缺失且未排队向量 {sqlite_health['missing_unqueued_count']} 条"
+        )
+        integrity_action = "运行向量补齐/对账；SQLite 是派生索引，不要删除 Markdown 原文"
+    else:
+        integrity_message = (
+            f"Markdown {markdown_health['file_count']} 个，解析与 ID 唯一性正常；"
+            f"向量 {sqlite_health['vector_count']} 条，SQLite 完整"
+        )
+        integrity_action = ""
+    checks.append(_check(
+        "integrity",
+        "记忆完整性",
+        integrity_status,
+        integrity_message,
+        details=integrity,
+        action=integrity_action,
     ))
 
     gh_cfg = cfg.get("github_sync", {}) or {}

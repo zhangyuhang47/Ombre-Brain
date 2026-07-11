@@ -16,7 +16,7 @@ write_memory.py — 手动写入记忆的命令行小工具
 不做什么（边界）：
 - 不调 LLM、不做 analyze、不做合并查重
 - 不启动 BucketManager，直接拼 frontmatter 写文件
-- 不同步 embedding（后台 decay/打分下次读到会补）
+- 不直接生成 embedding（服务启动对账 / decay 自愈 / 手动 backfill 会排队补齐）
 
 对外暴露：CLI 入口。
 ========================================

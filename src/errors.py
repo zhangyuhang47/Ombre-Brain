@@ -104,7 +104,8 @@ ERROR_CODES: dict[str, ErrorSpec] = {
         title_en="Embedding API call failed",
         suggestion_zh=(
             "检查网络可达性、OMBRE_EMBED_API_KEY 是否有效、配额是否耗尽。"
-            "本次写入会记录到 buckets，但不生成向量；下次重试时调用 /api/embeddings/backfill 补齐。"
+            "本次写入仍会保存到 buckets，向量由后台自动重试；也可调用 "
+            "/api/embedding/backfill 手动触发全库对账。"
         ),
     ),
     "OB-E002": ErrorSpec(

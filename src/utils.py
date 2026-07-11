@@ -188,6 +188,18 @@ def load_config(config_path: Optional[str] = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        "storage": {
+            "external_change_poll_seconds": 1.0,
+        },
+        "embedding": {
+            "enabled": True,
+            "background_indexing": True,
+            "retry_base_seconds": 5,
+            "retry_max_seconds": 300,
+            "circuit_failure_threshold": 3,
+            "circuit_base_seconds": 30,
+            "circuit_max_seconds": 600,
+        },
     }
 
     # --- Load user config from YAML file ---
@@ -241,6 +253,14 @@ def load_config(config_path: Optional[str] = None) -> dict:
     _apply_env_override(config, "OMBRE_EMBED_MODEL", "embedding", "model")
     _apply_env_override(config, "OMBRE_EMBED_FORMAT", "embedding", "api_format")
     _apply_env_float_override(config, "OMBRE_EMBED_TIMEOUT_SECONDS", "embedding", "timeout_seconds")
+
+    # Obsidian / Git / manual Markdown edits cache poll interval.
+    _apply_env_float_override(
+        config,
+        "OMBRE_EXTERNAL_CHANGE_POLL_SECONDS",
+        "storage",
+        "external_change_poll_seconds",
+    )
 
     # 顶层运行时
     _apply_env_override(config, "OMBRE_TRANSPORT", "transport")
