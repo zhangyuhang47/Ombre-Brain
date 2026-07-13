@@ -142,6 +142,12 @@ def effective_configuration_report(
     env = environment if environment is not None else os.environ
     deployment = persisted_config.get("deployment")
     persisted_deployment = deployment if isinstance(deployment, Mapping) else {}
+    # 未走 /onboarding 向导、但已经在 Dashboard「MCP 鉴权」面板里手动保存过一次的用户，
+    # config.yaml 里会显式出现 mcp_require_auth（或 mcp_auth_mode）键——这是他们做过
+    # 主动选择的证据，不该被当成「从没配置过」持续提醒重新走向导。
+    manual_auth_configured = (
+        "mcp_require_auth" in persisted_config or "mcp_auth_mode" in persisted_config
+    )
     saved_auth = _as_bool(persisted_config.get("mcp_require_auth"), default=True)
     effective_auth = _as_bool(runtime_config.get("mcp_require_auth"), default=True)
     environment_sources: list[dict[str, str]] = []
@@ -169,6 +175,7 @@ def effective_configuration_report(
     return {
         "profile": str(persisted_deployment.get("profile") or "unconfigured"),
         "onboarding_completed": bool(persisted_deployment.get("onboarding_completed")),
+        "manual_auth_configured": manual_auth_configured,
         "config_path": config_path,
         "saved": {
             "transport": saved_transport,

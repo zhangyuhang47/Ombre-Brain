@@ -2,6 +2,12 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.6.8
+
+- 修复「实际生效配置」诊断项无论怎么设置都持续显示「需处理」的问题：该项此前只认走完 `/onboarding` 向导写入的 `deployment.profile`，在 Dashboard「MCP 连接」面板直接保存鉴权设置不会触发。现在只要 `config.yaml` 里出现过 `mcp_require_auth` 或 `mcp_auth_mode`（即手动保存过一次），即视为主动配置，诊断项转为正常；从未配置过的全新安装仍会照常提示。
+- 修复记忆桶列表工具栏（全选当前筛选 / 已选 / 主动遗忘 / 沉底 / 归档）字号与周围按钮不一致的问题，统一为与站内其他按钮一致的 12px + 32px 高度。
+- 「开发者模式」开关从记忆桶工具栏移到设置 → 高级区域最底部，单独成一个明确标注风险的区块，并换成站内统一的胶囊开关组件；受它控制的「永久删除测试桶」按钮仍保留在原处。
+
 ## 2.6.7
 
 - 新增 `/mcp` 静态 Token 鉴权模式（`mcp_auth_mode: token`），与 OAuth 互斥、三选一：默认 `oauth` 不变、`token` 供支持自定义请求头但走不通浏览器 OAuth 授权流程的第三方 MCP 客户端使用、`off` 保持原有免鉴权语义。Token 走 `Authorization: Bearer` 或 `Ombre-MCP-Token` 请求头，不支持 URL 查询参数；选了 `token` 后 OAuth 的 discovery/register/authorize/token 路由全部 404。

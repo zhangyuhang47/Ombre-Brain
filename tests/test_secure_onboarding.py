@@ -80,6 +80,36 @@ def test_effective_report_exposes_environment_override_without_hiding_saved_valu
     assert report["environment_sources"] == report["overrides"]
 
 
+def test_effective_report_flags_manual_auth_configuration_without_onboarding() -> None:
+    """用户没走 /onboarding，但已经在「MCP 连接」面板手动保存过鉴权——
+    profile 仍是 unconfigured，但 manual_auth_configured 要能让诊断识别出
+    这是一次主动选择，而不是从没配置过。"""
+    report = effective_configuration_report(
+        {"transport": "streamable-http", "mcp_require_auth": True},
+        {"mcp_require_auth": True},
+    )
+
+    assert report["profile"] == "unconfigured"
+    assert report["manual_auth_configured"] is True
+
+    report_mode_only = effective_configuration_report(
+        {"transport": "streamable-http", "mcp_require_auth": True, "mcp_auth_mode": "token"},
+        {"mcp_auth_mode": "token"},
+    )
+
+    assert report_mode_only["manual_auth_configured"] is True
+
+
+def test_effective_report_manual_auth_configured_is_false_for_fresh_install() -> None:
+    report = effective_configuration_report(
+        {"transport": "stdio", "mcp_require_auth": True},
+        {},
+    )
+
+    assert report["profile"] == "unconfigured"
+    assert report["manual_auth_configured"] is False
+
+
 def test_effective_report_does_not_warn_for_matching_platform_defaults() -> None:
     report = effective_configuration_report(
         {"transport": "streamable-http", "mcp_require_auth": True, "buckets_dir": "/app/buckets"},

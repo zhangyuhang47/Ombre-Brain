@@ -1932,13 +1932,12 @@
 <div class="content" id="list-view">
   <div class="filters" id="filters"></div>
   <div class="bucket-bulkbar">
-    <label style="display:inline-flex;align-items:center;gap:6px;"><input id="bucket-select-all" type="checkbox" onchange="selectAllFiltered(this.checked)"> 全选当前筛选</label>
+    <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);height:32px;"><input id="bucket-select-all" type="checkbox" onchange="selectAllFiltered(this.checked)" style="accent-color:var(--accent);cursor:pointer;"> 全选当前筛选</label>
     <span id="bucket-selected-count" style="color:var(--text-dim);font-size:12px;">已选 0</span>
-    <button onclick="runBucketBatch('forget')">主动遗忘</button>
-    <button onclick="runBucketBatch('resolve')">沉底</button>
-    <button onclick="runBucketBatch('archive')">归档</button>
-    <button class="developer-only" onclick="hardDeleteSelectedTests()" style="color:#b85c3c;">永久删除测试桶</button>
-    <label style="margin-left:auto;display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);"><input id="developer-mode-toggle" type="checkbox" onchange="setDeveloperMode(this.checked)"> 开发者模式</label>
+    <button onclick="runBucketBatch('forget')" style="height:32px;padding:0 12px;font-size:12px;">主动遗忘</button>
+    <button onclick="runBucketBatch('resolve')" style="height:32px;padding:0 12px;font-size:12px;">沉底</button>
+    <button onclick="runBucketBatch('archive')" style="height:32px;padding:0 12px;font-size:12px;">归档</button>
+    <button class="developer-only" onclick="hardDeleteSelectedTests()" style="height:32px;padding:0 12px;font-size:12px;color:#b85c3c;">永久删除测试桶</button>
   </div>
   <div class="bucket-list" id="bucket-list">
     <div class="loading">加载中… / Loading…</div>
@@ -2944,6 +2943,22 @@
         <summary style="cursor:pointer;font-size:12px;color:var(--text-dim);">查看完整 JSON 预览</summary>
         <pre id="mcp-json-preview" style="margin-top:8px;padding:12px;background:var(--surface-solid);border-radius:11px;font-size:11px;line-height:1.6;overflow-x:auto;color:var(--text);white-space:pre-wrap;word-break:break-all;box-shadow:inset 2px 2px 5px var(--shadow-dark-subtle),inset -2px -2px 4px var(--shadow-light);"></pre>
       </details>
+    </div>
+
+    <!-- 高级区域最底下：开发者模式，危险操作单独隔离，默认关闭 -->
+    <div class="config-section" id="sec-dev-mode" data-sgroup="advanced">
+      <h3>开发者模式 <span class="sec-en">Developer Mode</span></h3>
+      <p style="font-size:12px;color:var(--negative);margin:0 0 14px;line-height:1.7;">
+        ⚠ 危险区域：开启后会在「记忆桶」列表的批量操作栏里露出「永久删除测试桶」按钮——只对创建时明确标记
+        <code>test_data=True</code> 的桶生效，真实记忆不受影响，但删除后不可撤销。不确定就保持关闭。
+      </p>
+      <div class="hw-toggle-row" style="gap:10px;align-items:center;">
+        <span class="hw-switch" id="developer-mode-sw" role="switch" aria-checked="false"
+          onclick="syncHwSwitch(this,'developer-mode-toggle'); setDeveloperMode(document.getElementById('developer-mode-toggle').checked)"></span>
+        <span style="font-size:13px;color:var(--text);cursor:pointer;" onclick="document.getElementById('developer-mode-sw').click()">开启开发者模式 <span class="en">Developer Mode</span></span>
+        <input type="checkbox" id="developer-mode-toggle" style="display:none"
+          onchange="syncSwFromCb('developer-mode-toggle','developer-mode-sw',''); setDeveloperMode(this.checked)">
+      </div>
     </div>
 
     <!-- ⑦ GitHub 同步 -->
@@ -4170,6 +4185,8 @@ function setDeveloperMode(enabled) {
 document.addEventListener('DOMContentLoaded', function() {
   var toggle = document.getElementById('developer-mode-toggle');
   if (toggle) toggle.checked = developerMode;
+  var sw = document.getElementById('developer-mode-sw');
+  if (sw) sw.setAttribute('aria-checked', developerMode ? 'true' : 'false');
   setDeveloperMode(developerMode);
 });
 

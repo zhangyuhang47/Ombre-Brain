@@ -649,14 +649,15 @@ async def build_system_diagnostics() -> dict[str, Any]:
         effective_auth = bool(effective_report["effective"]["mcp_require_auth"])
         profile = str(effective_report.get("profile") or "unconfigured")
         overrides = effective_report.get("overrides") or []
+        manual_auth_configured = bool(effective_report.get("manual_auth_configured"))
         if profile == "public_secure" and not effective_auth:
             config_status = "error"
             config_message = "公网安全模式的实际 OAuth 已关闭，当前配置不安全"
             config_action = "删除/修正 OMBRE_MCP_REQUIRE_AUTH，或重新运行安全部署向导"
-        elif profile == "unconfigured":
+        elif profile == "unconfigured" and not manual_auth_configured:
             config_status = "warning"
             config_message = "尚未选择部署模式；系统仍按安全默认运行"
-            config_action = "打开 /onboarding 选择本机、公网安全或高级模式"
+            config_action = "打开 /onboarding 选择本机、公网安全或高级模式，或在「⑥ MCP 连接」直接设置鉴权"
         elif overrides:
             config_status = "warning"
             config_message = f"部署模式已配置，但有 {len(overrides)} 个启动环境变量覆盖已保存设置"
@@ -665,6 +666,13 @@ async def build_system_diagnostics() -> dict[str, Any]:
             config_status = "warning"
             config_message = "部署设置已保存，但当前进程尚未采用新值"
             config_action = "使用 Dashboard 右上角重启按钮使设置生效"
+        elif profile == "unconfigured" and manual_auth_configured:
+            config_status = "ok"
+            config_message = (
+                "未使用部署向导，但已在「MCP 连接」手动配置鉴权（当前："
+                + ("需要鉴权" if effective_auth else "已关闭鉴权") + "）"
+            )
+            config_action = ""
         else:
             config_status = "ok"
             config_message = "已保存配置与当前实际生效值一致"
